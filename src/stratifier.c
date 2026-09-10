@@ -32,6 +32,7 @@
 #include "libckpool.h"
 #include "bitcoin.h"
 #include "sha2.h"
+#include "bip310.h"
 #include "stratifier.h"
 #include "uthash.h"
 #include "utlist.h"
@@ -306,6 +307,11 @@ struct stratum_instance {
 
 	int64_t suggest_diff; /* Stratum client suggested diff */
 	double best_diff; /* Best share found by this instance */
+
+	/* BIP310 version rolling is negotiated per connection. */
+	bool version_rolling;
+	uint32_t version_mask; /* Last mask returned to this miner. */
+	unsigned int version_min_bit_count; /* Diagnostic request, 0 if omitted. */
 
 	sdata_t *sdata; /* Which sdata this client is bound to */
 	proxy_t *proxy; /* Proxy this is bound to in proxy mode */
@@ -6846,15 +6852,17 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 	memcpy(data, wb->headerbin, 80);
 	memcpy(data + 36, merkle_root, 32);
 
-	/* nVersion: full replace (SV2) or BIP320 mask OR (SV1) */
+	/* nVersion: full replace for SV2; strict BIP310 replacement for SV1.
+	 * A zero in version_bits must clear a job bit inside the negotiated mask,
+	 * hence OR semantics are incorrect here. */
+	data32 = (uint32_t *)data;
 	if (full_version) {
-		data32 = (uint32_t *)data;
 		*data32 = htobe32(version_field);
-	} else if (version_field) {
-		uint32_t version_mask = htobe32(version_field);
+	} else if (client->version_rolling) {
+		uint32_t version = bip310_apply_version(wb->version, client->version_mask,
+						   version_field);
 
-		data32 = (uint32_t *)data;
-		*data32 |= version_mask;
+		*data32 = htobe32(version);
 	}
 
 	/* Insert the nonce value into the data */
@@ -7638,12 +7646,12 @@ static bool parse_submit(stratum_instance_t *client, yyjson_mut_val *params_val,
 			 enum share_err *err_code)
 {
 	bool share = false, result = false, invalid = true, submit = false, stale = false;
-	const char *workername, *job_id, *ntime, *version_mask;
+	const char *workername, *job_id, *ntime, *version_bits;
 	double diff = client->diff, wdiff = 0, sdiff = -1;
 	char hexhash[68] = {}, sharehash[32], cdfield[64];
 	user_instance_t *user = client->user_instance;
 	char *fname = NULL, *nonce, *nonce2;
-	uint32_t ntime32, version_mask32 = 0;
+	uint32_t ntime32, version_bits32 = 0;
 	sdata_t *sdata = client->sdata;
 	enum share_err err = SE_NONE;
 	char idstring[24] = {};
@@ -7694,15 +7702,20 @@ static bool parse_submit(stratum_instance_t *client, yyjson_mut_val *params_val,
 		goto out;
 	}
 
-	version_mask = yyjson_mut_get_str(yyjson_mut_arr_get(params_val, 5));
-	if (version_mask && strlen(version_mask) && validhex(version_mask)) {
-		sscanf(version_mask, "%x", &version_mask32);
-		// check version mask
-		if (version_mask32 && ((~ckpool.version_mask) & version_mask32) != 0) {
-			// means client changed some bits which server doesn't allow to change
+	version_bits = yyjson_mut_get_str(yyjson_mut_arr_get(params_val, 5));
+	if (client->version_rolling) {
+		/* BIP310 activates exactly one extra mining.submit parameter. */
+		if (unlikely(yyjson_mut_arr_size(params_val) != 6 ||
+		             !version_bits ||
+		             !bip310_parse_mask(version_bits, &version_bits32) ||
+		             !bip310_version_bits_valid(version_bits32, client->version_mask))) {
 			err = SE_INVALID_VERSION_MASK;
 			goto out;
 		}
+	} else if (unlikely(yyjson_mut_arr_size(params_val) != 5)) {
+		/* The sixth field is only valid after successful version-rolling setup. */
+		err = SE_INVALID_VERSION_MASK;
+		goto out;
 	}
 	if (safecmp(workername, client->workername)) {
 		err = SE_WORKER_MISMATCH;
@@ -7761,7 +7774,7 @@ static bool parse_submit(stratum_instance_t *client, yyjson_mut_val *params_val,
 	}
 	if (id < sdata->blockchange_id)
 		stale = true;
-	sdiff = submission_diff(sdata, client, wb, nonce2, ntime32, version_mask32, false,
+	sdiff = submission_diff(sdata, client, wb, nonce2, ntime32, version_bits32, false,
 				nonce, hash, stale);
 	if (sdiff > client->best_diff) {
 		worker_instance_t *worker = client->worker_instance;
@@ -7845,7 +7858,7 @@ out_nowb:
 	 * stale shares and filter out the rest. */
 	if (wb && wb->proxy && submit) {
 		LOGINFO("Submitting share upstream: %s", hexhash);
-		submit_share(client, id, nonce2, ntime, nonce, version_mask32);
+		submit_share(client, id, nonce2, ntime, nonce, version_bits32);
 	}
 
 	add_submit(client, diff, result, submit);
@@ -8341,22 +8354,113 @@ static void parse_method(sdata_t *sdata, stratum_instance_t *client,
 
         if (cmdmatch(method, "mining.configure")) {
 		yyjson_mut_doc *doc;
-		yyjson_mut_val *root;
-
-		char version_str[12];
+		yyjson_mut_val *root, *result, *extensions = NULL, *extparams = NULL;
+		yyjson_mut_val *mask_val, *min_bits_val, *id_copy;
+		uint32_t miner_mask = BIP310_FULL_MASK, effective_mask;
+		unsigned int min_bits = 0;
+		char version_str[9];
+		bool requested = false, config_error = false;
+		size_t i, count = 0;
 
 		LOGINFO("Mining configure requested from %s %s", client->identity,
 			client->address);
-		sprintf(version_str, "%08x", ckpool.version_mask);
 
 		doc = yyjson_mut_doc_new(&ckyyalc);
-		root = yyjson_mut_pack_val(doc, "{s{sbss}sosn}",
-			"result",
-			"version-rolling", true,
-			"version-rolling.mask", version_str,
-			"id", id_val,
-			"error");
+		if (unlikely(!doc))
+			quit(1, "Failed to allocate mining.configure response");
+		root = yyjson_mut_obj(doc);
+		result = yyjson_mut_obj(doc);
+		if (unlikely(!root || !result))
+			quit(1, "Failed to allocate mining.configure response values");
 		yyjson_mut_doc_set_root(doc, root);
+		yyjson_mut_obj_add_val(doc, root, "result", result);
+		if (id_val && (id_copy = yyjson_mut_val_mut_copy(doc, id_val)))
+			yyjson_mut_obj_add_val(doc, root, "id", id_copy);
+		else
+			yyjson_mut_obj_add_null(doc, root, "id");
+		yyjson_mut_obj_add_null(doc, root, "error");
+
+		if (yyjson_mut_is_arr(params_val) && yyjson_mut_arr_size(params_val) >= 1) {
+			extensions = yyjson_mut_arr_get(params_val, 0);
+			extparams = yyjson_mut_arr_get(params_val, 1);
+		}
+
+		/* BIP310 requires a result for every requested extension. Unknown
+		 * extensions are explicitly reported as unsupported. */
+		if (yyjson_mut_is_arr(extensions)) {
+			count = yyjson_mut_arr_size(extensions);
+			for (i = 0; i < count; ++i) {
+				const char *extension = yyjson_mut_get_str(yyjson_mut_arr_get(extensions, i));
+
+				if (!extension || !*extension)
+					continue;
+				if (!strcmp(extension, "version-rolling")) {
+					requested = true;
+					continue;
+				}
+				{
+					yyjson_mut_val *key = yyjson_mut_strcpy(doc, extension);
+					yyjson_mut_val *unsupported = yyjson_mut_bool(doc, false);
+
+					if (key && unsupported)
+						yyjson_mut_obj_put(result, key, unsupported);
+				}
+			}
+		}
+
+		if (requested) {
+			if (extparams && !yyjson_mut_is_obj(extparams)) {
+				config_error = true;
+			} else if (extparams) {
+				mask_val = yyjson_mut_obj_get(extparams, "version-rolling.mask");
+				if (mask_val) {
+					const char *mask = yyjson_mut_get_str(mask_val);
+
+					if (!mask || !bip310_parse_mask(mask, &miner_mask))
+						config_error = true;
+				}
+
+				min_bits_val = yyjson_mut_obj_get(extparams,
+							       "version-rolling.min-bit-count");
+				if (min_bits_val) {
+					int requested_bits;
+
+					if (!yyjson_mut_is_int(min_bits_val) ||
+					    (requested_bits = yyjson_mut_get_int(min_bits_val)) < 0) {
+						config_error = true;
+					} else {
+						min_bits = (unsigned int)requested_bits;
+					}
+				} else {
+					/* ESP-Miner currently omits this formally required BIP310
+					 * parameter. Treat omission as zero for compatibility while
+					 * keeping mask semantics strict. */
+					LOGINFO("BIP310 client %s omitted min-bit-count; assuming 0",
+						client->identity);
+				}
+			}
+
+			if (config_error) {
+				yyjson_mut_obj_add_strcpy(doc, result, "version-rolling",
+							   "invalid version-rolling parameters");
+			} else {
+				effective_mask = bip310_negotiate_mask(ckpool.version_mask, miner_mask);
+				client->version_rolling = true;
+				client->version_mask = effective_mask;
+				client->version_min_bit_count = min_bits;
+				bip310_format_mask(version_str, effective_mask);
+				yyjson_mut_obj_add_bool(doc, result, "version-rolling", true);
+				yyjson_mut_obj_add_strcpy(doc, result, "version-rolling.mask",
+							   version_str);
+				LOGNOTICE("BIP310 %s miner_mask=%08x server_mask=%08x effective=%08x min_bits=%u",
+					  client->identity, miner_mask, ckpool.version_mask,
+					  effective_mask, min_bits);
+				if (bip310_popcount(effective_mask) < min_bits)
+					LOGWARNING("BIP310 %s requested %u bits but effective mask %s exposes %u",
+						   client->identity, min_bits, version_str,
+						   bip310_popcount(effective_mask));
+			}
+		}
 
 		stratum_add_yysend(sdata, doc, client_id, SM_CONFIGURE);
 		return;
