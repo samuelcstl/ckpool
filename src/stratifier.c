@@ -20,10 +20,6 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <openssl/ec.h>
-#include <openssl/ecdsa.h>
-#include <openssl/obj_mac.h>  /* for NID_secp256k1 */
-
 #ifdef HAVE_ZMQ_H
 #include <zmq.h>
 #endif
@@ -215,10 +211,7 @@ struct worker_instance {
 	double best_diff; /* Best share found by this worker */
 	int64_t best_ever; /* Best share ever found by this worker */
 	int mindiff; /* User chosen mindiff */
-	/* Password diff setting starts here */
-	bool fixed_diff; /* True if md= fixed diff set via password field; disables vardiff */
-	bool password_diff; /* True if d= or md= was set via password field; ignore firmware suggest_difficulty */
-	/* Password diff setting ends here */
+
 	bool idle;
 	bool notified_idle;
 };
@@ -598,7 +591,7 @@ static int ser_bip34_height(uint8_t *buf, uint32_t height)
 static void generate_coinbase(workbase_t *wb)
 {
 	uint64_t u64, g64, d64 = 0;
-	uint32_t u32, net_time;
+	uint32_t u32;
 	sdata_t *sdata = ckpool.sdata;
 	char header[272];
 	int len, ofs = 0;
@@ -609,23 +602,11 @@ static void generate_coinbase(workbase_t *wb)
 	wb->coinb1bin = ckzalloc(128);
 
 	/* Strings in wb should have been zero memset prior. Generate binary
-	 * templates first, then convert to hex.
-	 * Peercoin's transaction serialization requires a 4-byte tx timestamp
-	 * immediately after the 4-byte version field. Since coinb1 is sent
-	 * verbatim to miners (who hash it as an opaque byte string with no
-	 * Peercoin-specific knowledge), the timestamp must be a permanent
-	 * part of coinb1 itself here, not spliced in later only for our own
-	 * internal hash calculations. */
-	net_time = htole32(wb->ntime32);
-	memcpy(wb->coinb1bin, scriptsig_header_bin, 4);      /* nVersion */
-	ofs = 4;
-	memcpy(wb->coinb1bin + ofs, &net_time, 4);           /* Peercoin tx timestamp */
-	ofs += 4;
-	memcpy(wb->coinb1bin + ofs, scriptsig_header_bin + 4, 37); /* txin count + prevout hash + prevout index */
-	ofs += 37;
-	/* ofs == 45 here (was 41 pre-Peercoin) */
+	 * templates first, then convert to hex */
+	memcpy(wb->coinb1bin, scriptsig_header_bin, 41);
+	ofs += 41; // Fixed header length;
 
-	ofs++; // Script length is filled in at the end @wb->coinb1bin[45];
+	ofs++; // Script length is filled in at the end @wb->coinb1bin[41];
 
 	/* Put block height at start of template */
 	if (unlikely(ckpool.regtest))
@@ -661,7 +642,7 @@ static void generate_coinbase(workbase_t *wb)
 
 	wb->coinb1len = ofs;
 
-	len = wb->coinb1len - 45;
+	len = wb->coinb1len - 41;
 
 	len += wb->enonce1varlen;
 	len += wb->enonce2varlen;
@@ -681,7 +662,7 @@ static void generate_coinbase(workbase_t *wb)
 	}
 	len += wb->coinb2len;
 
-	wb->coinb1bin[45] = len - 1; /* Set the length now */
+	wb->coinb1bin[41] = len - 1; /* Set the length now */
 	__bin2hex(wb->coinb1, wb->coinb1bin, wb->coinb1len);
 	LOGDEBUG("Coinb1: %s", wb->coinb1);
 	/* Coinbase 1 complete */
@@ -739,7 +720,7 @@ static void generate_coinbase(workbase_t *wb)
 	wb->coinb3len += sizeof(uint32_t); //4
 
 	if (!ckpool.btcsolo) {
-		int coinbase_len, offset;
+		int coinbase_len, offset = 0;
 		char *coinbase, *cb;
 
 		/* Append the generation address and coinb3 in !solo mode */
@@ -755,21 +736,15 @@ static void generate_coinbase(workbase_t *wb)
 		if (unlikely(!ckpool.coinbase_valid)) {
 			char *cbstr;
 
-			/* coinb1bin already includes the Peercoin tx timestamp,
-			 * so just concatenate the pieces as-is. */
+			/* We have enough to test the validity of the coinbase here */
 			coinbase_len = wb->coinb1len + ckpool.nonce1length + ckpool.nonce2length + wb->coinb2len;
 			coinbase = ckzalloc(coinbase_len);
-
 			memcpy(coinbase, wb->coinb1bin, wb->coinb1len);
-			offset = wb->coinb1len;
-
+			offset += wb->coinb1len;
 			/* Space for nonce1 and 2 */
 			offset += ckpool.nonce1length + ckpool.nonce2length;
-
-			/* Copy coinb2 */
 			memcpy(coinbase + offset, wb->coinb2bin, wb->coinb2len);
 			offset += wb->coinb2len;
-
 			cb = bin2hex(coinbase, offset);
 			LOGDEBUG("Coinbase txn %s", cb);
 			free(coinbase);
@@ -791,17 +766,15 @@ static void generate_coinbase(workbase_t *wb)
 		}
 	} else if (unlikely(!ckpool.coinbase_valid)) {
 		/* Create a sample coinbase to test its validity in solo mode */
-		int coinbase_len, offset;
+		int coinbase_len, offset = 0;
 		char *coinbase, *cb;
 		char *cbstr;
 
 		coinbase_len = wb->coinb1len + ckpool.nonce1length + ckpool.nonce2length + wb->coinb2len +
 			       sdata->txnlen + wb->coinb3len + 1;
 		coinbase = ckzalloc(coinbase_len);
-
 		memcpy(coinbase, wb->coinb1bin, wb->coinb1len);
-		offset = wb->coinb1len;
-
+		offset += wb->coinb1len;
 		offset += ckpool.nonce1length + ckpool.nonce2length;
 		memcpy(coinbase + offset, wb->coinb2bin, wb->coinb2len);
 		offset += wb->coinb2len;
@@ -811,7 +784,6 @@ static void generate_coinbase(workbase_t *wb)
 		offset += sdata->txnlen;
 		memcpy(coinbase + offset, wb->coinb3bin, wb->coinb3len);
 		offset += wb->coinb3len;
-
 		cb = bin2hex(coinbase, offset);
 		LOGDEBUG("Coinbase txn %s", cb);
 		free(coinbase);
@@ -1800,6 +1772,7 @@ retry:
 
 		txn_array = yyjson_obj_get(wb->gbtroot, "transactions");
 		txns = wb_merkle_bin_txns(sdata, wb, txn_array, true);
+
 		wb->insert_witness = false;
 
 		witnessdata_check = yyjson_get_str(yyjson_obj_get(wb->gbtroot, "default_witness_commitment"));
@@ -2380,67 +2353,44 @@ static void send_node_block(sdata_t *sdata, const char *enonce1, const char *non
 
 /* Process a block into a message for the generator to submit. Must hold
  * workbase readcount */
-
 static char *
 process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 	      const uchar *data, const uchar *hash, uchar *flip32, char *blockhash)
 {
 	char *gbt_block, *hexcoinbase, varint[12];
-	int txns = 1 + wb->txns; /* Coinbase plus any mempool transactions */
+	int txns = wb->txns + 1;
+
 	flip_32(flip32, hash);
 	__bin2hex(blockhash, flip32, 32);
-	hexcoinbase = ckzalloc(cblen * 2 + 10);
-	/* Extra +160 bytes reserves room for the trailing vchBlockSig field
-	 * (1-byte compact-size length prefix + up to 72-byte DER signature,
-	 * hex-encoded = up to 146 hex chars) */
-	gbt_block = ckzalloc(80 * 2 + sizeof(varint) * 2 + 8 + cblen * 2 + 20 + 160 +
-		      (wb->txn_data ? strlen(wb->txn_data) : 0));
-	
-	/* 1. Append 80-byte header */
+
+	/* Message format: "data". Size the buffers to the actual coinbase
+	 * length: 80 byte header + up to 5 byte txn count varint + coinbase,
+	 * all hex encoded, plus room for the null terminator. Transaction
+	 * data beyond that is appended via realloc_strcat which grows the
+	 * buffer as needed. */
+	hexcoinbase = alloca(cblen * 2 + 1);
+	gbt_block = ckzalloc(80 * 2 + sizeof(varint) * 2 + cblen * 2 + 1);
 	__bin2hex(gbt_block, data, 80);
-	
-	/* 2. Append transaction count varint (will be 0x01) */
 	if (txns < 0xfd) {
 		uint8_t val8 = txns;
+
 		__bin2hex(varint, (const unsigned char *)&val8, 1);
 	} else if (txns <= 0xffff) {
 		uint16_t val16 = htole16(txns);
+
 		strcat(gbt_block, "fd");
 		__bin2hex(varint, (const unsigned char *)&val16, 2);
 	} else {
 		uint32_t val32 = htole32(txns);
+
 		strcat(gbt_block, "fe");
 		__bin2hex(varint, (const unsigned char *)&val32, 4);
 	}
 	strcat(gbt_block, varint);
-	
-	/* 3. Coinbase (already includes the Peercoin tx timestamp as part of
-	 * coinb1bin from generate_coinbase()) */
-	__bin2hex(hexcoinbase, (const unsigned char *)coinbase, cblen);
+	__bin2hex(hexcoinbase, coinbase, cblen);
 	strcat(gbt_block, hexcoinbase);
-	
-	/* 4. Append any mempool transactions after the coinbase. wb->txn_data
-	 * holds them pre-concatenated as hex, in the same order used to
-	 * build the merkle branches in wb_merkle_bin_txns(), so appending
-	 * them here as-is keeps the block body consistent with the
-	 * hashMerkleRoot already written into the header. */
-	if (wb->txns && wb->txn_data)
-		strcat(gbt_block, wb->txn_data);
-
-	/*
-	 * 5. Peercoin CBlock serialization includes vchBlockSig after
-	 * the transaction vector.
-	 *
-	 * For current post-BTC16-BIPs proof-of-work blocks Peercoin
-	 * does not require CheckBlockSignature().  Serialize an empty
-	 * vector here: CompactSize(0) == 0x00.
-	 *
-	 * This deliberately keeps every payout private key outside
-	 * ckpool.
-	 */
-	strcat(gbt_block, "00");
-
-	free(hexcoinbase);
+	if (wb->txns)
+		realloc_strcat(&gbt_block, wb->txn_data);
 	return gbt_block;
 }
 
@@ -6273,13 +6223,12 @@ static user_instance_t *generate_user(stratum_instance_t *client,
 	ck_wunlock(&sdata->instance_lock);
 
 	if (!ckpool.proxy && (new_user || !user->btcaddress)) {
-		/* Accept Peercoin 'P' addresses or standard verified addresses */
-		if ((username[0] == 'P' || username[0] == 'u' || username[0] == 'U') || generator_checkaddr(username, &user->script, &user->segwit)) {
+		/* Is this a btc address based username? */
+		if (generator_checkaddr(username, &user->script, &user->segwit)) {
 			user->btcaddress = true;
 			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
 		}
 	}
-	
 	if (new_user) {
 		LOGNOTICE("Added new user %s%s", username, user->btcaddress ?
 			  " as address based registration" : "");
@@ -6350,42 +6299,8 @@ static void update_solo_client(sdata_t *sdata, workbase_t *wb, const int64_t cli
 				 user_instance_t *user_instance)
 {
 	yyjson_mut_doc *doc = __user_notify(wb, user_instance, true);
+
 	stratum_add_yysend(sdata, doc, client_id, SM_UPDATE);
-}
-/* Password diff setting starts here */
-/*
- * Parse the stratum password field for difficulty directives, supporting
- * both local miners (e.g. NerdQAxe++) and rented-rig / marketplace clients
- * (miningrigrentals.com, NiceHash, etc) that pass extra parameters in the
- * password. Tokens are comma or semicolon separated, e.g.:
- *   "d=25000"            -> mindiff + startdiff, vardiff continues to run
- *   "md=300000"          -> fixed diff, vardiff engine disabled
- *   "x,d=25000"          -> ignores unrelated tokens, still picks up d=
- * Matching is case-insensitive. Invalid or missing values are ignored,
- * leaving pool defaults untouched. If both d= and md= are present, md=
- * (fixed) takes precedence.
- */
-static void parse_password_diff(const char *pass, int64_t *req_mindiff, int64_t *req_fixeddiff)
-{
-	char *tokstr, *token, *saveptr = NULL;
-	if (!pass || !strlen(pass))
-		return;
-	tokstr = strdupa(pass);
-	token = strtok_r(tokstr, ",;", &saveptr);
-	while (token) {
-		while (*token == ' ' || *token == '\t')
-			token++;
-		if (!strncasecmp(token, "md=", 3)) {
-			int64_t val = strtoll(token + 3, NULL, 10);
-			if (val > 0)
-				*req_fixeddiff = val;
-		} else if (!strncasecmp(token, "d=", 2)) {
-			int64_t val = strtoll(token + 2, NULL, 10);
-			if (val > 0)
-				*req_mindiff = val;
-		}
-		token = strtok_r(NULL, ",;", &saveptr);
-	}
 }
 
 /* Needs to be entered with client holding a ref count. */
@@ -6441,45 +6356,10 @@ static bool parse_authorise(stratum_instance_t *client, yyjson_mut_val *params_v
 	/* NOTE workername is NULL prior to this so should not be used in code
 	 * till after this point */
 	client->workername = strdup(buf);
-
 	if (pass)
 		client->password = strndup(pass, 64);
 	else
 		client->password = strdup("");
-	{
-		int64_t req_mindiff = 0, req_fixeddiff = 0;
-		parse_password_diff(client->password, &req_mindiff, &req_fixeddiff);
-		if (req_fixeddiff > 0) {
-			if (ckpool.mindiff && req_fixeddiff < ckpool.mindiff)
-				req_fixeddiff = ckpool.mindiff;
-			if (ckpool.maxdiff && req_fixeddiff > ckpool.maxdiff)
-				req_fixeddiff = ckpool.maxdiff;
-			client->worker_instance->mindiff = (int)req_fixeddiff;
-			client->worker_instance->fixed_diff = true;
-			client->worker_instance->password_diff = true;
-			client->diff = client->old_diff = req_fixeddiff;
-			LOGNOTICE("Client %s worker %s set fixed diff %"PRId64" from password field",
-				client->identity, buf, req_fixeddiff);
-		} else if (req_mindiff > 0) {
-			if (ckpool.mindiff && req_mindiff < ckpool.mindiff)
-				req_mindiff = ckpool.mindiff;
-			if (ckpool.maxdiff && req_mindiff > ckpool.maxdiff)
-				req_mindiff = ckpool.maxdiff;
-			client->worker_instance->mindiff = (int)req_mindiff;
-			client->worker_instance->fixed_diff = false;
-			client->worker_instance->password_diff = true;
-			client->diff = client->old_diff = req_mindiff;
-			LOGNOTICE("Client %s worker %s set mindiff/startdiff %"PRId64" from password field",
-				client->identity, buf, req_mindiff);
-		} else if (client->worker_instance->password_diff) {
-			client->worker_instance->mindiff = 0;
-			client->worker_instance->fixed_diff = false;
-			client->worker_instance->password_diff = false;
-			LOGINFO("Client %s worker %s cleared password-set diff, reverting to pool defaults",
-				client->identity, buf);
-		}
-	}
-
 	if (user->failed_authtime) {
 		time_t now_t = time(NULL);
 
@@ -6536,8 +6416,6 @@ out:
 	}
 	return ret;
 }
-/* Password diff setting ends here */
-
 
 /* Needs to be entered with client holding a ref count. */
 static void stratum_send_diff(sdata_t *sdata, const stratum_instance_t *client)
@@ -6636,18 +6514,13 @@ static void add_submit(stratum_instance_t *client, const double diff, const bool
 	if (ckpool.node)
 		return;
 
-	/* Password diff setting starts here */
-	if (unlikely(worker->fixed_diff))
-		return;
-	/* Password diff setting ends here */
-
 	client->ssdc++;
 	bdiff = sane_tdiff(&now_t, &client->first_share);
 	tdiff = sane_tdiff(&now_t, &client->ldc);
 
-	/* Check the difficulty every 180 seconds or as many shares as we
+	/* Check the difficulty every 240 seconds or as many shares as we
 	 * should have had in that time, whichever comes first. */
-	if (client->ssdc < 20 && tdiff < 180)
+	if (client->ssdc < 72 && tdiff < 240)
 		return;
 
 	if (diff != client->diff) {
@@ -6659,7 +6532,7 @@ static void add_submit(stratum_instance_t *client, const double diff, const bool
 	 * If shares are coming in fast, calculate based on
 	 * the one minute rolling average for quick diff adjustment, otherwise
 	 * use the 5 minute rolling average */
-	if (client->ssdc >= 20) {
+	if (client->ssdc >= 72) {
 		bias = time_bias(bdiff, 60);
 		dsps = client->dsps1 / bias;
 	} else {
@@ -6669,7 +6542,7 @@ static void add_submit(stratum_instance_t *client, const double diff, const bool
 	drr = dsps / (double)client->diff;
 
 	/* Optimal rate product is 0.3, allow some hysteresis. */
-	if (drr > 0.04167 && drr < 0.1111)
+	if (drr > 0.15 && drr < 0.4)
 		return;
 
 	/* Client suggest diff overrides worker mindiff */
@@ -6679,11 +6552,11 @@ static void add_submit(stratum_instance_t *client, const double diff, const bool
 		mindiff = worker->mindiff;
 	/* Allow slightly lower diffs when users choose their own mindiff */
 	if (mindiff) {
-		if (drr < 0.1389)
+		if (drr < 0.5)
 			return;
-		optimal = lround(dsps * 8.64);
+		optimal = lround(dsps * 2.4);
 	} else
-		optimal = lround(dsps * 12);
+		optimal = lround(dsps * 3.33);
 
 	/* Clamp to mindiff ~ network_diff */
 
@@ -6958,10 +6831,8 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 
 	cblen += cb2len;
 
-	/* coinbase already includes the Peercoin tx timestamp as part of
-	 * coinb1bin, so hash it directly. */
 	gen_hash((uchar *)coinbase, merkle_root, cblen);
-	memcpy(merkle_sha, merkle_root, 32);	
+	memcpy(merkle_sha, merkle_root, 32);
 	for (i = 0; i < wb->merkles; i++) {
 		memcpy(merkle_sha + 32, &wb->merklebin[i], 32);
 		gen_hash(merkle_sha, merkle_root, 64);
@@ -8221,17 +8092,11 @@ static void suggest_diff(stratum_instance_t *client, const char *method,
 {
 	yyjson_mut_val *arr_val = yyjson_mut_arr_get(params_val, 0);
 	int64_t sdiff;
+
 	if (unlikely(!client_active(client))) {
 		LOGNOTICE("Attempted to suggest diff on unauthorised client %s", client->identity);
 		return;
 	}
-	/* Password diff setting starts here */
-	if (unlikely(client->worker_instance && client->worker_instance->password_diff)) {
-		LOGINFO("Ignoring suggest_difficulty from client %s, diff set explicitly via password field",
-			client->identity);
-		return;
-	}
-	/* Password diff setting ends here */
 	if (arr_val && yyjson_mut_is_num(arr_val)) {
 		double dsdiff = yyjson_mut_get_num(arr_val);
 
@@ -8671,13 +8536,12 @@ static user_instance_t *generate_remote_user(const char *workername)
 	user = get_create_user(sdata, username, &new_user);
 
 	if (!ckpool.proxy && (new_user || !user->btcaddress)) {
-		/* Accept Peercoin 'P' addresses or standard verified addresses */
-		if ((username[0] == 'P' || username[0] == 'u' || username[0] == 'U') || generator_checkaddr(username, &user->script, &user->segwit)) {
+		/* Is this a btc address based username? */
+		if (generator_checkaddr(username, &user->script, &user->segwit)) {
 			user->btcaddress = true;
 			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
 		}
 	}
-	
 	if (new_user) {
 		LOGNOTICE("Added new remote user %s%s", username, user->btcaddress ?
 			  " as address based registration" : "");
@@ -9712,17 +9576,11 @@ static void sauth_process(json_params_t *jp)
 	}
 
 	/* Update the client now if they have set a valid mindiff different
-	 * from the startdiff. suggest_diff overrides worker mindiff, unless
-	 * a fixed diff (md=) was set via the password field, which always
-	 * takes precedence. */
-	/* Password diff setting starts here */
-	if (client->worker_instance->fixed_diff)
-		mindiff = client->worker_instance->mindiff;
-	else if (client->suggest_diff)
+	 * from the startdiff. suggest_diff overrides worker mindiff */
+	if (client->suggest_diff)
 		mindiff = client->suggest_diff;
 	else
 		mindiff = client->worker_instance->mindiff;
-	/* Password diff setting ends here */
 	if (mindiff) {
 		mindiff = MAX(ckpool.mindiff, mindiff);
 		if (mindiff != client->diff) {
@@ -10725,9 +10583,24 @@ void *stratifier(void *arg)
 		hex2bin(scriptsig_header_bin, scriptsig_header, 41);
 		sdata->txnlen = address_to_txn(sdata->txnbin, ckpool.btcaddress, ckpool.script, ckpool.segwit);
 
-		/* Bypassed strict Bitcoin donation validation check for Peercoin environment */
-		ckpool.donvalid = false;
-		LOGNOTICE("Skipping strict Bitcoin donation validation for Peercoin environment");
+		/* Find a valid donation address if possible */
+		if (generator_checkaddr(ckpool.donaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+			ckpool.donvalid = true;
+			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
+			LOGNOTICE("BTC donation address valid %s", ckpool.donaddress);
+		} else if (generator_checkaddr(ckpool.tndonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+			ckpool.donaddress = ckpool.tndonaddress;
+			ckpool.donvalid = true;
+			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
+			LOGNOTICE("BTC testnet donation address valid %s", ckpool.donaddress);
+		} else if (generator_checkaddr(ckpool.rtdonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+			ckpool.donaddress = ckpool.rtdonaddress;
+			ckpool.donvalid = true;
+			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
+			LOGNOTICE("BTC regtest donation address valid %s", ckpool.donaddress);
+			ckpool.regtest = true;
+		} else
+			LOGNOTICE("No valid donation address found");
 	}
 
 	randomiser = time(NULL);

@@ -30,7 +30,7 @@ static bool check_required_rule(const char* rule)
 	return false;
 }
 
-/* Take a bitcoin/peercoin address and do some sanity checks on it, then send it to
+/* Take a bitcoin address and do some sanity checks on it, then send it to
  * bitcoind to see if it's a valid address */
 bool validate_address(connsock_t *cs, const char *address, bool *script, bool *segwit)
 {
@@ -68,20 +68,21 @@ bool validate_address(connsock_t *cs, const char *address, bool *script, bool *s
 		goto out;
 	}
 	if (!yyjson_is_true(valid_val)) {
-		LOGDEBUG("Address %s is NOT valid", address);
+		LOGDEBUG("Bitcoin address %s is NOT valid", address);
 		goto out;
 	}
 	ret = true;
 	tmp_val = yyjson_obj_get(res_val, "isscript");
 	if (unlikely(!tmp_val)) {
-		/* All recent daemons with wallet support built in should
+		/* All recent bitcoinds with wallet support built in should
 		 * support this, if not, look for addresses the braindead way
-		 * to tell if it's a script address. Updated for Peercoin ('U' / 'P'). */
-		LOGDEBUG("No isscript support from daemon");
-		if (address[0] == '3' || address[0] == '2' || address[0] == 'U')
+		 * to tell if it's a script address. */
+		LOGDEBUG("No isscript support from bitcoind");
+		if (address[0] == '3' || address[0] == '2')
 			*script = true;
-		/* Now look to see this isn't unsupported format */
-		else if (address[0] != '1' && address[0] != 'm' && address[0] != 'P')
+		/* Now look to see this isn't a bech32: We can't support
+		 * bech32 without knowing if it's a pubkey or a script */
+		else if (address[0] != '1' && address[0] != 'm')
 			ret = false;
 		goto out;
 	}
@@ -90,7 +91,7 @@ bool validate_address(connsock_t *cs, const char *address, bool *script, bool *s
 	if (unlikely(!tmp_val))
 		goto out;
 	*segwit = yyjson_is_true(tmp_val);
-	LOGDEBUG("Address %s IS valid%s%s", address, *script ? " script" : "",
+	LOGDEBUG("Bitcoin address %s IS valid%s%s", address, *script ? " script" : "",
 		 *segwit ? " segwit" : "");
 out:
 	if (doc)
@@ -108,36 +109,20 @@ yyjson_doc *validate_txn(connsock_t *cs, const char *txn)
 		LOGWARNING("Null transaction passed to validate_txn");
 		goto out;
 	}
-	
-	/* Peercoin compatibility bypass: return a mocked successful decoderawtransaction response
-	 * so ckpool's startup coinbase validation check passes successfully. */
 	len = strlen(txn) + 64;
 	rpc_req = ckalloc(len);
 	sprintf(rpc_req, "{\"method\": \"decoderawtransaction\", \"params\": [\"%s\"]}", txn);
 	doc = yyjson_rpc_call(cs, rpc_req);
 	dealloc(rpc_req);
-
-	if (!doc) {
-		// Fallback mock JSON document so startup doesn't abort
-		const char *mock_response = "{\"result\": {\"txid\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"version\": 1, \"size\": 200, \"vin\": [], \"vout\": []}, \"error\": null, \"id\": 0}";
-		doc = yyjson_read(mock_response, strlen(mock_response), 0);
-	} else {
-		// Check if the real call returned a TX decode error, and inject a mock result if it did
-		yyjson_val *root = yyjson_doc_get_root(doc);
-		yyjson_val *err = yyjson_obj_get(root, "error");
-		if (err && !yyjson_is_null(err)) {
-			yyjson_doc_free(doc);
-			const char *mock_response = "{\"result\": {\"txid\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"version\": 1, \"size\": 200, \"vin\": [], \"vout\": []}, \"error\": null, \"id\": 0}";
-			doc = yyjson_read(mock_response, strlen(mock_response), 0);
-		}
-	}
+	if (!doc)
+		LOGDEBUG("%s:%s Failed to get valid json response to decoderawtransaction", cs->url, cs->port);
 out:
 	return doc;
 }
 
 static const char *gbt_req = "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": [\"coinbasetxn\", \"workid\", \"coinbase/append\"], \"rules\" : [\"segwit\"]}]}\n";
 
-/* Request getblocktemplate from daemon already connected with a connsock_t
+/* Request getblocktemplate from bitcoind already connected with a connsock_t
  * and then summarise the information to the most efficient set of data
  * required to assemble a mining template, storing it in a gbtbase_t structure */
 bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
@@ -289,7 +274,7 @@ void clear_gbtbase(gbtbase_t *gbt)
 
 static const char *blockcount_req = "{\"method\": \"getblockcount\"}\n";
 
-/* Request getblockcount from daemon, returning the count or -1 if the call
+/* Request getblockcount from bitcoind, returning the count or -1 if the call
  * fails. */
 int get_blockcount(connsock_t *cs)
 {
@@ -318,7 +303,7 @@ out:
 	return ret;
 }
 
-/* Request getblockhash from daemon for height, writing the value into *hash
+/* Request getblockhash from bitcoind for height, writing the value into *hash
  * which should be at least 65 bytes long since the hash is 64 chars. */
 bool get_blockhash(connsock_t *cs, int height, char *hash)
 {
@@ -364,7 +349,7 @@ out:
 
 static const char *bestblockhash_req = "{\"method\": \"getbestblockhash\"}\n";
 
-/* Request getbestblockhash from daemon. */
+/* Request getbestblockhash from bitcoind. bitcoind 0.9+ only */
 bool get_bestblockhash(connsock_t *cs, char *hash)
 {
 	yyjson_doc *doc;

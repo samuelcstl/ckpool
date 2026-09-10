@@ -295,10 +295,10 @@ static bool server_alive(server_instance_t *si, bool pinging)
 	}
 	clear_gbtbase(&gbt);
 	if (unlikely(ckpool.btcsolo && !ckpool.btcaddress)) {
-		/* Fallback to user btcaddress if donation checks fail on Peercoin */
-		if (validate_address(cs, ckpool.btcaddress, &ckpool.script, &ckpool.segwit))
-			goto skip_donations;
-
+		/* If no btcaddress is specified in solobtc mode, choose one of
+		 * the donation addresses from mainnet, testnet, or regtest for
+		 * coinbase validation later on, although it will not be used
+		 * for mining. */
 		if (validate_address(cs, ckpool.donaddress, &ckpool.script, &ckpool.segwit))
 			ckpool.btcaddress = ckpool.donaddress;
 		else if (validate_address(cs, ckpool.tndonaddress, &ckpool.script, &ckpool.segwit))
@@ -306,7 +306,6 @@ static bool server_alive(server_instance_t *si, bool pinging)
 		else if (validate_address(cs, ckpool.rtdonaddress, &ckpool.script, &ckpool.segwit))
 			ckpool.btcaddress = ckpool.rtdonaddress;
 	}
-skip_donations:
 
 	if (!ckpool.node && !validate_address(cs, ckpool.btcaddress, &ckpool.script, &ckpool.segwit)) {
 		LOGWARNING("Invalid btcaddress: %s !", ckpool.btcaddress);
@@ -327,7 +326,7 @@ static server_instance_t *live_server(gdata_t *gdata)
 	connsock_t *cs;
 	int i;
 
-	LOGDEBUG("Attempting to connect to daemon");
+	LOGDEBUG("Attempting to connect to bitcoind");
 retry:
 	/* First find a server that is already flagged alive if possible
 	 * without blocking on server_alive() */
@@ -350,7 +349,7 @@ retry:
 			goto living;
 		}
 	}
-	LOGWARNING("CRITICAL: No daemons active!");
+	LOGWARNING("CRITICAL: No bitcoinds active!");
 	sleep(5);
 	goto retry;
 living:
@@ -455,9 +454,9 @@ reconnect:
 
 	cs = &si->cs;
 	if (!old_si)
-		LOGWARNING("Connected to daemon: %s:%s", cs->url, cs->port);
+		LOGWARNING("Connected to bitcoind: %s:%s", cs->url, cs->port);
 	else if (si != old_si)
-		LOGWARNING("Failed over to daemon: %s:%s", cs->url, cs->port);
+		LOGWARNING("Failed over to bitcoind: %s:%s", cs->url, cs->port);
 
 retry:
 	clear_unix_msg(&umsg);
@@ -467,7 +466,7 @@ retry:
 	} while (!umsg);
 
 	if (unlikely(!si->alive)) {
-		LOGWARNING("%s:%s Daemon socket invalidated, will attempt failover", cs->url, cs->port);
+		LOGWARNING("%s:%s Bitcoind socket invalidated, will attempt failover", cs->url, cs->port);
 		goto reconnect;
 	}
 
@@ -5449,9 +5448,9 @@ reconnect:
 			goto out;
 		cs = &si->cs;
 		if (!old_si)
-			LOGWARNING("Connected to daemon: %s:%s", cs->url, cs->port);
+			LOGWARNING("Connected to bitcoind: %s:%s", cs->url, cs->port);
 		else if (si != old_si)
-			LOGWARNING("Failed over to daemon: %s:%s", cs->url, cs->port);
+			LOGWARNING("Failed over to bitcoind: %s:%s", cs->url, cs->port);
 	}
 
 	/* This does not necessarily mean we reconnect, but a change has
@@ -5609,18 +5608,18 @@ static void server_mode(proc_instance_t *pi)
 	dealloc(ckpool.servers);
 }
 
-static proxy_instance_t *__add_proxy(gdata_t *gdata, const int num)
+static proxy_instance_t *__add_proxy(gdata_t *gdata, const int id)
 {
 	proxy_instance_t *proxy;
 
 	gdata->proxies_generated++;
 	proxy = ckzalloc(sizeof(proxy_instance_t));
-	proxy->id = num;
-	proxy->url = strdup(ckpool.proxyurl[num]);
+	proxy->id = id;
+	proxy->url = strdup(ckpool.proxyurl[id]);
 	proxy->baseurl = strdup(proxy->url);
-	proxy->auth = strdup(ckpool.proxyauth[num]);
-	if (ckpool.proxypass[num])
-		proxy->pass = strdup(ckpool.proxypass[num]);
+	proxy->auth = strdup(ckpool.proxyauth[id]);
+	if (ckpool.proxypass[id])
+		proxy->pass = strdup(ckpool.proxypass[id]);
 	else
 		proxy->pass = strdup("");
 #ifdef HAVE_SV2
@@ -5698,6 +5697,9 @@ void *generator(void *arg)
 	ckpool.gdata = gdata;
 
 	if (ckpool.proxy) {
+		/* Wait for the stratifier to be ready for us */
+		while (!ckpool.stratifier_ready)
+			cksleep_ms(10);
 		proxy_mode(pi);
 	} else
 		server_mode(pi);
