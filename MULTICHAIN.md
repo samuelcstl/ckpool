@@ -12,15 +12,19 @@ Three generic configuration keys cover the known forms of chain-specific `getblo
 
 The operations are deliberately generic. They correspond to add/replace, remove, and append rather than to named chains.
 
-Examples:
+### Bitcoin
+
+No GBT override is required:
 
 ```json
-// Bitcoin: no override required
 {}
 ```
 
+### Litecoin Cash SHA256d
+
+Add a fixed field to the template request:
+
 ```json
-// Litecoin Cash SHA256d: add a fixed field to the template request
 {
   "gbtparams": {
     "powalgo": "sha256d"
@@ -28,15 +32,21 @@ Examples:
 }
 ```
 
+### DigiByte SHA256d
+
+Append the node's mining-algorithm positional argument:
+
 ```json
-// DigiByte SHA256d: append the node's algorithm positional argument
 {
   "gbtargs": ["sha256d"]
 }
 ```
 
+### Bitcoin Cash style GBT
+
+Omit the SegWit rules declaration:
+
 ```json
-// Bitcoin Cash style GBT: omit the SegWit rules declaration
 {
   "gbtdrop": ["rules"]
 }
