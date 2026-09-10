@@ -123,12 +123,14 @@ out:
 /*
  * Build the getblocktemplate request from the normal Bitcoin defaults plus
  * optional fixed configuration data. gbtparams is merged into the first
- * BIP22/BIP23 request object with configured values replacing defaults.
- * gbtargs is appended as additional JSON-RPC positional parameters.
+ * BIP22/BIP23 request object with configured values replacing defaults,
+ * gbtdrop removes fields from that object, and gbtargs is appended as
+ * additional JSON-RPC positional parameters.
  *
  * This deliberately contains no chain names. For example LCC can select its
- * SHA256d template with gbtparams:{"powalgo":"sha256d"}, while DigiByte can
- * select SHA256d with gbtargs:["sha256d"]. JSON value types are preserved.
+ * SHA256d template with gbtparams:{"powalgo":"sha256d"}, DigiByte can select
+ * SHA256d with gbtargs:["sha256d"], and a BCH-style request can drop rules.
+ * JSON value types are preserved for configured values.
  */
 static char *build_gbt_req(void)
 {
@@ -197,6 +199,30 @@ static char *build_gbt_req(void)
 			if (unlikely(!mut_key || !mut_val ||
 			             !yyjson_mut_obj_put(request, mut_key, mut_val)))
 				goto out;
+		}
+	}
+
+	configured = yyjson_obj_get(conf_root, "gbtdrop");
+	if (configured && !yyjson_is_null(configured)) {
+		size_t i, count;
+
+		if (!yyjson_is_arr(configured)) {
+			LOGERR("gbtdrop must be a JSON array");
+			goto out;
+		}
+		count = yyjson_arr_size(configured);
+		for (i = 0; i < count; i++) {
+			const char *name;
+
+			val = yyjson_arr_get(configured, i);
+			if (unlikely(!yyjson_is_str(val))) {
+				LOGERR("gbtdrop entries must be strings");
+				goto out;
+			}
+			name = yyjson_get_str(val);
+			if (unlikely(!name))
+				goto out;
+			yyjson_mut_obj_remove_key(request, name);
 		}
 	}
 
