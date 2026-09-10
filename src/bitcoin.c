@@ -120,7 +120,113 @@ out:
 	return doc;
 }
 
-static const char *gbt_req = "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": [\"coinbasetxn\", \"workid\", \"coinbase/append\"], \"rules\" : [\"segwit\"]}]}\n";
+/*
+ * Build the getblocktemplate request from the normal Bitcoin defaults plus
+ * optional fixed configuration data. gbtparams is merged into the first
+ * BIP22/BIP23 request object with configured values replacing defaults.
+ * gbtargs is appended as additional JSON-RPC positional parameters.
+ *
+ * This deliberately contains no chain names. For example LCC can select its
+ * SHA256d template with gbtparams:{"powalgo":"sha256d"}, while DigiByte can
+ * select SHA256d with gbtargs:["sha256d"]. JSON value types are preserved.
+ */
+static char *build_gbt_req(void)
+{
+	yyjson_mut_doc *req_doc;
+	yyjson_mut_val *root, *params, *request, *capabilities, *rules;
+	yyjson_doc *conf_doc = NULL;
+	yyjson_val *conf_root = NULL, *configured, *key, *val;
+	yyjson_read_err err;
+	char *req = NULL;
+
+	req_doc = yyjson_mut_doc_new(&ckyyalc);
+	if (unlikely(!req_doc))
+		return NULL;
+
+	root = yyjson_mut_obj(req_doc);
+	params = yyjson_mut_arr(req_doc);
+	request = yyjson_mut_obj(req_doc);
+	capabilities = yyjson_mut_arr(req_doc);
+	rules = yyjson_mut_arr(req_doc);
+	if (unlikely(!root || !params || !request || !capabilities || !rules))
+		goto out;
+
+	yyjson_mut_doc_set_root(req_doc, root);
+	if (!yyjson_mut_obj_add_str(req_doc, root, "method", "getblocktemplate"))
+		goto out;
+	if (!yyjson_mut_arr_add_str(req_doc, capabilities, "coinbasetxn") ||
+	    !yyjson_mut_arr_add_str(req_doc, capabilities, "workid") ||
+	    !yyjson_mut_arr_add_str(req_doc, capabilities, "coinbase/append") ||
+	    !yyjson_mut_obj_add_val(req_doc, request, "capabilities", capabilities) ||
+	    !yyjson_mut_arr_add_str(req_doc, rules, "segwit") ||
+	    !yyjson_mut_obj_add_val(req_doc, request, "rules", rules) ||
+	    !yyjson_mut_arr_add_val(params, request) ||
+	    !yyjson_mut_obj_add_val(req_doc, root, "params", params))
+		goto out;
+
+	/* The main config parser already owns the overall configuration. Read it
+	 * here only for GBT-specific opaque JSON so common code does not need a
+	 * growing set of chain-specific fields in ckpool_t. */
+	if (ckpool.config)
+		conf_doc = yyjson_read_file(ckpool.config, YYJSON_READ_STOP_WHEN_DONE, NULL, &err);
+	if (!conf_doc)
+		goto write;
+
+	conf_root = yyjson_doc_get_root(conf_doc);
+	if (!yyjson_is_obj(conf_root))
+		goto write;
+
+	configured = yyjson_obj_get(conf_root, "gbtparams");
+	if (configured && !yyjson_is_null(configured)) {
+		yyjson_obj_iter iter;
+
+		if (!yyjson_is_obj(configured)) {
+			LOGERR("gbtparams must be a JSON object");
+			goto out;
+		}
+		iter = yyjson_obj_iter_with(configured);
+		while ((key = yyjson_obj_iter_next(&iter))) {
+			const char *name = yyjson_get_str(key);
+			yyjson_mut_val *mut_key, *mut_val;
+
+			val = yyjson_obj_iter_get_val(key);
+			if (unlikely(!name || !val))
+				goto out;
+			mut_key = yyjson_mut_strcpy(req_doc, name);
+			mut_val = yyjson_val_mut_copy(req_doc, val);
+			if (unlikely(!mut_key || !mut_val ||
+			             !yyjson_mut_obj_put(request, mut_key, mut_val)))
+				goto out;
+		}
+	}
+
+	configured = yyjson_obj_get(conf_root, "gbtargs");
+	if (configured && !yyjson_is_null(configured)) {
+		size_t i, count;
+
+		if (!yyjson_is_arr(configured)) {
+			LOGERR("gbtargs must be a JSON array");
+			goto out;
+		}
+		count = yyjson_arr_size(configured);
+		for (i = 0; i < count; i++) {
+			yyjson_mut_val *mut_val;
+
+			val = yyjson_arr_get(configured, i);
+			mut_val = yyjson_val_mut_copy(req_doc, val);
+			if (unlikely(!mut_val || !yyjson_mut_arr_add_val(params, mut_val)))
+				goto out;
+		}
+	}
+
+write:
+	req = yyjson_mut_write(req_doc, YYJSON_WRITE_NEWLINE_AT_END, NULL);
+out:
+	if (conf_doc)
+		yyjson_doc_free(conf_doc);
+	yyjson_mut_doc_free(req_doc);
+	return req;
+}
 
 /* Request getblocktemplate from bitcoind already connected with a connsock_t
  * and then summarise the information to the most efficient set of data
@@ -138,13 +244,20 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	const char *flags;
 	const char *bits;
 	const char *rule;
+	char *gbt_req;
 	int version;
 	int curtime;
 	int height;
 	int i;
 	bool ret = false;
 
+	gbt_req = build_gbt_req();
+	if (unlikely(!gbt_req)) {
+		LOGERR("Failed to build getblocktemplate request");
+		return ret;
+	}
 	doc = yyjson_rpc_call(cs, gbt_req);
+	dealloc(gbt_req);
 	if (!doc) {
 		LOGWARNING("%s:%s Failed to get valid json response to getblocktemplate", cs->url, cs->port);
 		return ret;
