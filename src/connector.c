@@ -22,8 +22,17 @@
 #include "utlist.h"
 #include "stratifier.h"
 #include "generator.h"
+#ifdef HAVE_SV2
+#include "sv2_conn.h"
+#include "sv2_strat.h"
+#include "sv2_jd.h"
+#endif
 
 #define MAX_MSGSIZE 1024
+/* Trusted remote / node peers may send larger JSON than a miner, but must
+ * still have a finite ceiling so a compromised peer cannot grow the recv
+ * buffer without bound. */
+#define MAX_REMOTE_MSGSIZE (16 * 1024 * 1024)
 
 typedef struct client_instance client_instance_t;
 typedef struct sender_send sender_send_t;
@@ -72,8 +81,9 @@ struct client_instance {
 	/* Is this the parent passthrough client */
 	bool passthrough;
 
-	/* Linked list of shares in redirector mode.*/
+	/* Linked list of in-flight mining.submit ids in redirector mode. */
 	share_t *shares;
+	int nshares;
 
 	/* Has this client already been told to redirect */
 	bool redirected;
@@ -83,8 +93,37 @@ struct client_instance {
 	/* Time this client started blocking, 0 when not blocked */
 	time_t blocked_time;
 
+	/* Time this client was accepted, and whether it has ever delivered a
+	 * complete message. A stratum_instance_t is only created once a whole
+	 * message reaches the stratifier, so a socket that connects and stays
+	 * silent is invisible to the stratifier's unauthorised client reaper
+	 * while still occupying an fd and a maxclients slot. Only the connector
+	 * can see these, so they are reaped here. got_msg is the SV1 latch
+	 * (first complete JSON); SV2 uses the setup/channel fields below. */
+	time_t accept_time;
+	bool got_msg;
+
 	/* The size of the socket send buffer */
 	int sendbufsize;
+
+	/* Bytes currently queued but not yet written to this client. Only
+	 * modified under the owning csender's lock. */
+	int64_t queued_bytes;
+
+#ifdef HAVE_SV2
+	/* True if accepted on an SV2 listen socket (binary Noise stream). */
+	bool sv2;
+	/* True if this SV2 socket is Job Declaration (not Mining). */
+	bool sv2_jd;
+	/* Per-connection Noise + reassembly (connector-owned). */
+	struct sv2_conn *sv2c;
+	/* Connector phase fields below are protected by cdata->lock. */
+	bool sv2_noise_done;
+	/* Set when SetupConnection.Success is queued; 0 until then. */
+	time_t sv2_setup_time;
+	/* Mining: Open*Channel.Success. JD: AllocateMiningJobToken.Success. */
+	bool sv2_has_channel;
+#endif
 };
 
 struct sender_send {
@@ -95,6 +134,15 @@ struct sender_send {
 	char *buf;
 	int len;
 	int ofs;
+	/* Length accounted against the client's queued_bytes at queue time.
+	 * len is consumed by partial writes and rewritten by SV2 encryption so
+	 * it cannot be used to reverse the accounting. */
+	int qlen;
+#ifdef HAVE_SV2
+	/* If true, buf is a plaintext SV2 frame; encrypt once on the owning
+	 * sender-shard thread before the first write. */
+	bool sv2_encrypt;
+#endif
 };
 
 struct share {
@@ -160,6 +208,8 @@ struct connector_data {
 	redirect_t *redirects;
 	/* What redirect we're currently up to */
 	int redirect;
+	/* In-flight mining.submit records across all redirector clients */
+	int redirector_shares;
 
 	/* Pending sends to the upstream server */
 	ckmsgq_t *upstream_sends;
@@ -255,8 +305,18 @@ static void __recycle_client(cdata_t *cdata, client_instance_t *client)
 	share_t *share, *tmp;
 
 	dealloc(client->buf);
-	DL_FOREACH_SAFE(client->shares, share, tmp)
-	    dealloc(share);
+	DL_FOREACH_SAFE(client->shares, share, tmp) {
+		cdata->redirector_shares--;
+		dealloc(share);
+	}
+	if (cdata->redirector_shares < 0)
+		cdata->redirector_shares = 0;
+#ifdef HAVE_SV2
+	if (client->sv2c) {
+		sv2_conn_free(client->sv2c);
+		client->sv2c = NULL;
+	}
+#endif
 
 	memset(client, 0, sizeof(client_instance_t));
 	client->id = -1;
@@ -298,12 +358,34 @@ static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
 	no_clients = HASH_COUNT(cdata->clients);
 	ck_runlock(&cdata->lock);
 
+	sockd = cdata->serverfd[server];
+
 	if (unlikely(ckpool.maxclients && no_clients >= ckpool.maxclients)) {
-		LOGWARNING("Server full with %d clients", no_clients);
+		static time_t last_full_warn = 0;
+		static int full_suppressed = 0;
+		time_t now_t = time(NULL);
+
+		/* The listen socket is level triggered so leaving the pending
+		 * connection unaccepted makes epoll_wait return immediately
+		 * forever, spinning a core and flooding the log. Accept and
+		 * close it instead so the backlog drains, and rate limit the
+		 * warning. */
+		fd = accept(sockd, NULL, NULL);
+		if (likely(fd >= 0))
+			Close(fd);
+		if (now_t - last_full_warn >= 60) {
+			if (full_suppressed) {
+				LOGWARNING("Server full with %d clients (%d further connections dropped)",
+					   no_clients, full_suppressed);
+			} else
+				LOGWARNING("Server full with %d clients", no_clients);
+			last_full_warn = now_t;
+			full_suppressed = 0;
+		} else
+			full_suppressed++;
 		return 0;
 	}
 
-	sockd = cdata->serverfd[server];
 	client = recruit_client(cdata);
 	client->server = server;
 	client->address = (struct sockaddr *)&client->address_storage;
@@ -314,6 +396,7 @@ static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
 		 * socket */
 		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) {
 			LOGNOTICE("Recoverable error on accept in accept_client");
+			recycle_client(cdata, client);
 			return 0;
 		}
 		LOGERR("Failed to accept on socket %d in acceptor", sockd);
@@ -349,17 +432,75 @@ static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
 	LOGINFO("Connected new client %d on socket %d to %d active clients from %s:%d",
 		cdata->nfds, fd, no_clients, client->address_name, port);
 
+#ifdef HAVE_SV2
+	if (ckpool.server_sv2 && server < (uint64_t)ckpool.serverurls &&
+	    ckpool.server_sv2[server]) {
+		/*
+		 * Reserve HS slot before keys/ECDH so rate limits cannot be
+		 * TOCTOUed past and expensive work is not free under flood.
+		 * Release on any failure path before hs_inflight is set.
+		 */
+		if (!sv2_handshake_try_reserve(client->address_name)) {
+			LOGNOTICE("SV2 handshake rate-limited from %s", client->address_name);
+			Close(fd);
+			recycle_client(cdata, client);
+			return 0;
+		}
+		if (!sv2_get_server_keys()) {
+			LOGERR("SV2 client rejected: server keys not initialised");
+			sv2_handshake_release();
+			Close(fd);
+			recycle_client(cdata, client);
+			return 0;
+		}
+		client->sv2 = true;
+		client->sv2_jd = ckpool.server_sv2_jd &&
+				server < (uint64_t)ckpool.serverurls &&
+				ckpool.server_sv2_jd[server];
+		client->sv2c = sv2_conn_new(sv2_get_server_keys());
+		if (!client->sv2c) {
+			LOGERR("SV2 conn setup failed for %s", client->address_name);
+			sv2_handshake_release();
+			Close(fd);
+			recycle_client(cdata, client);
+			return 0;
+		}
+		/*
+		 * JD: raise reassembly to JD policy payload + AEAD/header headroom.
+		 * Mining keeps SV2_MAX_MINING_PAYLOAD-scale default from sv2_conn_new
+		 * (not full U24) so a post-Noise peer cannot pin tens of MiB.
+		 */
+		if (client->sv2_jd)
+			sv2_conn_set_rx_max(client->sv2c,
+					    sv2_rx_max_for_payload(SV2_MAX_JD_PAYLOAD));
+		/* Slot owned by this conn until handshake complete or free */
+		client->sv2c->hs_inflight = true;
+		LOGNOTICE("SV2 %s client accepted from %s",
+			  client->sv2_jd ? "JD" : "mining", client->address_name);
+	}
+#endif
+
 	ck_wlock(&cdata->lock);
 	client->id = cdata->client_ids++;
 	HASH_ADD_I64(cdata->clients, id, client);
 	cdata->nfds++;
 	ck_wunlock(&cdata->lock);
 
+#ifdef HAVE_SV2
+	if (client->sv2) {
+		if (client->sv2_jd)
+			sv2_jd_note_client(client->id, client->address_name, (int)server);
+		else
+			sv2_strat_note_client(client->id, client->address_name, (int)server);
+	}
+#endif
+
 	/* We increase the ref count on this client as epoll creates a pointer
 	 * to it. We drop that reference when the socket is closed which
 	 * removes it automatically from the epoll list. */
 	__inc_instance_ref(client);
 	client->fd = fd;
+	client->accept_time = time(NULL);
 	optlen = sizeof(client->sendbufsize);
 	getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &client->sendbufsize, &optlen);
 	LOGDEBUG("Client sendbufsize detected as %d", client->sendbufsize);
@@ -403,19 +544,15 @@ static void stratifier_drop_id(const int64_t id)
 	send_proc(ckpool.stratifier, buf);
 }
 
-/* Client must hold a reference count */
-static int drop_client(cdata_t *cdata, client_instance_t *client)
+/* Complete the side effects after __drop_client has atomically invalidated and
+ * unhashed a client under cdata->lock. Client must hold a reference count. */
+static int finish_drop_client(cdata_t *cdata, client_instance_t *client, int fd)
 {
 	bool passthrough = client->passthrough, remote = client->remote;
 	char address_name[INET6_ADDRSTRLEN];
 	int64_t client_id = client->id;
-	int fd = -1;
 
 	strcpy(address_name, client->address_name);
-	ck_wlock(&cdata->lock);
-	fd = __drop_client(cdata, client);
-	ck_wunlock(&cdata->lock);
-
 	if (fd > -1) {
 		if (passthrough) {
 			LOGNOTICE("Connector dropped passthrough %"PRId64" %s",
@@ -426,6 +563,10 @@ static int drop_client(cdata_t *cdata, client_instance_t *client)
 		}
 		LOGDEBUG("Connector dropped fd %d", fd);
 		stratifier_drop_id(client_id);
+#ifdef HAVE_SV2
+		sv2_strat_drop_client(client_id);
+		sv2_jd_drop_client(client_id);
+#endif
 	}
 
 	return fd;
@@ -451,12 +592,12 @@ static void stratifier_drop_client(const client_instance_t *client)
  * regularly but keep the instances in a linked list until their ref count
  * drops to zero when we can remove them lazily. Client must hold a reference
  * count. */
-static int invalidate_client(cdata_t *cdata, client_instance_t *client)
+static int finish_invalidate_client(cdata_t *cdata, client_instance_t *client,
+				    int ret)
 {
-	client_instance_t *tmp;
-	int ret;
+	client_instance_t *dead, *tmp;
 
-	ret = drop_client(cdata, client);
+	ret = finish_drop_client(cdata, client, ret);
 	if ((!ckpool.passthrough || ckpool.node) && !client->passthrough)
 		stratifier_drop_client(client);
 	if (ckpool.passthrough)
@@ -465,16 +606,16 @@ static int invalidate_client(cdata_t *cdata, client_instance_t *client)
 	/* Cull old unused clients lazily when there are no more reference
 	 * counts for them. */
 	ck_wlock(&cdata->lock);
-	DL_FOREACH_SAFE2(cdata->dead_clients, client, tmp, dead_next) {
-		if (!client->ref) {
-			DL_DELETE2(cdata->dead_clients, client, dead_prev, dead_next);
-			LOGINFO("Connector recycling client %"PRId64, client->id);
+	DL_FOREACH_SAFE2(cdata->dead_clients, dead, tmp, dead_next) {
+		if (!dead->ref) {
+			DL_DELETE2(cdata->dead_clients, dead, dead_prev, dead_next);
+			LOGINFO("Connector recycling client %"PRId64, dead->id);
 			/* We only close the client fd once we're sure there
 			 * are no references to it left to prevent fds being
 			 * reused on new and old clients. */
-			nolinger_socket(client->fd);
-			Close(client->fd);
-			__recycle_client(cdata, client);
+			nolinger_socket(dead->fd);
+			Close(dead->fd);
+			__recycle_client(cdata, dead);
 		}
 	}
 	ck_wunlock(&cdata->lock);
@@ -482,24 +623,91 @@ static int invalidate_client(cdata_t *cdata, client_instance_t *client)
 	return ret;
 }
 
+static int invalidate_client(cdata_t *cdata, client_instance_t *client)
+{
+	int ret;
+
+	ck_wlock(&cdata->lock);
+	ret = __drop_client(cdata, client);
+	ck_wunlock(&cdata->lock);
+	return finish_invalidate_client(cdata, client, ret);
+}
+
 static void drop_all_clients(cdata_t *cdata)
 {
 	client_instance_t *client, *tmp;
+	int64_t *ids = NULL;
+	int n = 0, i;
 
+	/*
+	 * Match drop_client() side effects: after unhashing under cdata->lock,
+	 * notify stratifier and tear down SV2 mining/JD state so tokens,
+	 * channels, and client refs cannot leak across a bulk drop (e.g. reject).
+	 */
 	ck_wlock(&cdata->lock);
 	HASH_ITER(hh, cdata->clients, client, tmp) {
-		__drop_client(cdata, client);
+		int64_t id = client->id;
+
+		if (__drop_client(cdata, client) > -1) {
+			ids = ckrealloc(ids, (n + 1) * sizeof(*ids));
+			ids[n++] = id;
+		}
 	}
 	ck_wunlock(&cdata->lock);
+
+	for (i = 0; i < n; i++) {
+		stratifier_drop_id(ids[i]);
+#ifdef HAVE_SV2
+		sv2_strat_drop_client(ids[i]);
+		sv2_jd_drop_client(ids[i]);
+#endif
+	}
+	dealloc(ids);
 }
 
 static void send_client(cdata_t *cdata, int64_t id, char *buf);
 
-/* Look for shares being submitted via a redirector and add them to a linked
- * list for looking up the responses. */
-static void parse_redirector_share(cdata_t *cdata, client_instance_t *client, yyjson_mut_val *val)
+#define REDIR_SHARE_TTL		120
+#define REDIR_SHARE_MAX_CLIENT	64
+#define REDIR_SHARE_MAX_GLOBAL	4096
+
+/* Caller holds cdata wlock. */
+static void __unlink_redir_share(cdata_t *cdata, client_instance_t *client,
+				 share_t *share)
+{
+	DL_DELETE(client->shares, share);
+	if (client->nshares > 0)
+		client->nshares--;
+	if (cdata->redirector_shares > 0)
+		cdata->redirector_shares--;
+	dealloc(share);
+}
+
+/* Caller holds cdata wlock. List is FIFO (append-to-tail); stop at the first
+ * record still inside the TTL. */
+static void __expire_redir_shares(cdata_t *cdata, client_instance_t *client,
+				  time_t now)
 {
 	share_t *share, *tmp;
+
+	DL_FOREACH_SAFE(client->shares, share, tmp) {
+		if (now <= share->submitted + REDIR_SHARE_TTL)
+			break;
+		__unlink_redir_share(cdata, client, share);
+	}
+}
+
+static void __free_redir_shares(cdata_t *cdata, client_instance_t *client)
+{
+	while (client->shares)
+		__unlink_redir_share(cdata, client, client->shares);
+}
+
+/* Track an in-flight mining.submit id so an accepted result can qualify a
+ * redirect. Caller has already checked method == "mining.submit". */
+static void parse_redirector_share(cdata_t *cdata, client_instance_t *client, yyjson_mut_val *val)
+{
+	share_t *share;
 	time_t now;
 	int64_t id;
 
@@ -507,27 +715,217 @@ static void parse_redirector_share(cdata_t *cdata, client_instance_t *client, yy
 		LOGNOTICE("Failed to find redirector share id");
 		return;
 	}
-	share = ckzalloc(sizeof(share_t));
 	now = time(NULL);
-	share->submitted = now;
-	share->id = id;
 
-	LOGINFO("Redirector adding client %"PRId64" share id: %"PRId64, client->id, id);
-
-	/* We use the cdata lock instead of a separate lock since this function
-	 * is called infrequently. */
 	ck_wlock(&cdata->lock);
-	DL_APPEND(client->shares, share);
-
-	/* Age old shares. */
-	DL_FOREACH_SAFE(client->shares, share, tmp) {
-		if (now > share->submitted + 120) {
-			DL_DELETE(client->shares, share);
-			dealloc(share);
+	/* Only an accepted share from an already-authorised client may grant
+	 * access to a protected redirect. This check must be under the same lock
+	 * as the authorisation transition and share-list mutation. */
+	if (!client->authorised || client->redirected) {
+		ck_wunlock(&cdata->lock);
+		return;
+	}
+	__expire_redir_shares(cdata, client, now);
+	DL_FOREACH(client->shares, share) {
+		if (share->id == id) {
+			ck_wunlock(&cdata->lock);
+			return;
 		}
 	}
+	while (client->nshares >= REDIR_SHARE_MAX_CLIENT && client->shares)
+		__unlink_redir_share(cdata, client, client->shares);
+	if (cdata->redirector_shares >= REDIR_SHARE_MAX_GLOBAL) {
+		ck_wunlock(&cdata->lock);
+		return;
+	}
+	share = ckzalloc(sizeof(share_t));
+	share->submitted = now;
+	share->id = id;
+	DL_APPEND(client->shares, share);
+	client->nshares++;
+	cdata->redirector_shares++;
+	ck_wunlock(&cdata->lock);
+
+	LOGINFO("Redirector adding client %"PRId64" share id: %"PRId64, client->id, id);
+}
+
+/* The stratifier trusts client_id, address and server as connector generated.
+ * yyjson permits duplicate keys and returns the first match, so a key supplied
+ * by the remote end would shadow the one we append. Remove any existing copies
+ * before adding ours; yyjson_mut_obj_remove_key strips all duplicates of a
+ * name, so one call each is enough. Passthrough messages legitimately carry
+ * the subclient's address from the downstream connector so we only strip that
+ * on the direct client path where we generate it ourselves; srecv_process
+ * validates it in either case. */
+static void strip_reserved_keys(yyjson_mut_val *root, const bool strip_address)
+{
+	yyjson_mut_obj_remove_key(root, "client_id");
+	yyjson_mut_obj_remove_key(root, "server");
+	if (strip_address)
+		yyjson_mut_obj_remove_key(root, "address");
+}
+
+#ifdef HAVE_SV2
+/* Forward decls — defined later in this file. */
+static void queue_sender_send(cdata_t *cdata, client_instance_t *client,
+			      sender_send_t *sender_send);
+static void send_client_bin(cdata_t *cdata, client_instance_t *client,
+			    uint8_t *buf, int len);
+static client_instance_t *ref_client_by_id(cdata_t *cdata, int64_t id);
+
+/* SV2 binary path: Noise reassembly, decrypt, stratifier handle, encrypt reply.
+ * Returns false to drop. */
+static bool parse_client_msg_sv2(cdata_t *cdata, client_instance_t *client)
+{
+	uint8_t rdbuf[8192];
+	int ret;
+	uint8_t *reply = NULL;
+	size_t reply_len = 0;
+	uint8_t **frames = NULL;
+	size_t *frame_lens = NULL;
+	size_t nframes = 0, i;
+
+	ret = read(client->fd, rdbuf, sizeof(rdbuf));
+	if (ret < 1) {
+		if (likely(errno == EAGAIN || errno == EWOULDBLOCK || !ret))
+			return true;
+		LOGINFO("SV2 client id %"PRId64" fd %d disconnected - recv fail ret %d errno %d",
+			client->id, client->fd, ret, errno);
+		return false;
+	}
+	if (!sv2_conn_feed(client->sv2c, rdbuf, (size_t)ret, &reply, &reply_len,
+			   &frames, &frame_lens, &nframes)) {
+		LOGNOTICE("SV2 client %"PRId64" protocol/crypto error, dropping", client->id);
+		dealloc(reply);
+		for (i = 0; i < nframes; i++)
+			dealloc(frames[i]);
+		dealloc(frames);
+		dealloc(frame_lens);
+		return false;
+	}
+	if (sv2_conn_ready(client->sv2c)) {
+		ck_wlock(&cdata->lock);
+		client->sv2_noise_done = true;
+		ck_wunlock(&cdata->lock);
+	}
+	/* Handshake ciphertext — already Noise-framed; do not re-encrypt.
+	 * Completing Noise must not set got_msg; the idle reaper treats
+	 * sv2_noise_done, sv2_setup_time and sv2_has_channel as three phases. */
+	if (reply && reply_len) {
+		sender_send_t *ss = ckzalloc(sizeof(sender_send_t));
+
+		ss->client = client;
+		ss->buf = (char *)reply;
+		ss->len = (int)reply_len;
+		ss->sv2_encrypt = false;
+		inc_instance_ref(cdata, client);
+		queue_sender_send(cdata, client, ss);
+		reply = NULL;
+	}
+	dealloc(reply);
+
+	for (i = 0; i < nframes; i++) {
+		size_t rlen = 0;
+		uint8_t *rplain;
+
+		/*
+		 * Policy plaintext caps (rx_append already bounds ciphertext).
+		 * JD: SV2_MAX_JD_PAYLOAD; mining: SV2_MAX_MINING_PAYLOAD.
+		 */
+		{
+			size_t pcap = client->sv2_jd ?
+				(size_t)SV2_MAX_JD_PAYLOAD : (size_t)SV2_MAX_MINING_PAYLOAD;
+
+			if (frame_lens[i] > (size_t)SV2_FRAME_HEADER_LEN + pcap) {
+				LOGNOTICE("SV2 %s client %"PRId64" plaintext frame %zu > "
+					  "cap %zu — dropping frame",
+					  client->sv2_jd ? "JD" : "mining",
+					  client->id, frame_lens[i], pcap);
+				dealloc(frames[i]);
+				continue;
+			}
+		}
+		if (client->sv2_jd)
+			rplain = sv2_jd_handle_frame(client->id, frames[i],
+						     frame_lens[i], &rlen);
+		else
+			rplain = sv2_strat_handle_frame(client->id, frames[i],
+							frame_lens[i], &rlen);
+
+		dealloc(frames[i]);
+		if (rplain && rlen)
+			send_client_bin(cdata, client, rplain, (int)rlen);
+		else
+			dealloc(rplain);
+	}
+	dealloc(frames);
+	dealloc(frame_lens);
+	return true;
+}
+
+/* Latch pre-session progress from an outbound plaintext frame. Open*.Success
+ * is queued (not returned) so the send path is the single observer. */
+static void sv2_note_outbound_progress(cdata_t *cdata, client_instance_t *client,
+				       const uint8_t *plain, int plainlen)
+{
+	uint8_t mt;
+
+	if (plainlen < SV2_FRAME_HEADER_LEN)
+		return;
+	mt = plain[2];
+	ck_wlock(&cdata->lock);
+	if (mt == SV2_MSG_SETUP_CONNECTION_SUCCESS) {
+		if (!client->sv2_setup_time)
+			client->sv2_setup_time = time(NULL);
+	} else if (mt == SV2_MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS ||
+		   mt == SV2_MSG_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS ||
+		   mt == SV2_MSG_ALLOCATE_MINING_JOB_TOKEN_SUCCESS)
+		client->sv2_has_channel = true;
 	ck_wunlock(&cdata->lock);
 }
+
+/* Queue a plaintext SV2 frame for the owning sender shard. Encryption of the
+ * outbound Noise CipherState happens only on that shard thread. */
+static void send_client_bin(cdata_t *cdata, client_instance_t *client,
+			    uint8_t *plain, int plainlen)
+{
+	sender_send_t *ss;
+
+	if (!client->sv2 || !client->sv2c || plainlen < 1) {
+		dealloc(plain);
+		return;
+	}
+	sv2_note_outbound_progress(cdata, client, plain, plainlen);
+	ss = ckzalloc(sizeof(sender_send_t));
+	ss->client = client;
+	ss->buf = (char *)plain;
+	ss->len = plainlen;
+	ss->sv2_encrypt = true;
+	inc_instance_ref(cdata, client);
+	queue_sender_send(cdata, client, ss);
+}
+
+void connector_sv2_send_plain(int64_t client_id, uint8_t *plain, size_t plainlen)
+{
+	cdata_t *cdata = ckpool.cdata;
+	client_instance_t *client;
+
+	if (!cdata || !plain) {
+		dealloc(plain);
+		return;
+	}
+	client = ref_client_by_id(cdata, client_id);
+	if (!client || !client->sv2 || !client->sv2c) {
+		if (client)
+			dec_instance_ref(cdata, client);
+		dealloc(plain);
+		return;
+	}
+	/* Queue only; shard thread encrypts (single-writer CipherState). */
+	send_client_bin(cdata, client, plain, (int)plainlen);
+	dec_instance_ref(cdata, client);
+}
+#endif /* HAVE_SV2 */
 
 /* Client is holding a reference count from being on the epoll list. Returns
  * true if we will still be receiving messages from this client. */
@@ -537,14 +935,24 @@ static bool parse_client_msg(cdata_t *cdata, client_instance_t *client)
 	int buflen, ret;
 	char *eol;
 
+#ifdef HAVE_SV2
+	if (client->sv2)
+		return parse_client_msg_sv2(cdata, client);
+#endif
+
 retry:
 	if (unlikely(client->bufofs > MAX_MSGSIZE)) {
-		if (!client->remote) {
+		/* Remote clients are allowed a larger but finite ceiling. */
+		if (unlikely(!client->remote || client->bufofs > MAX_REMOTE_MSGSIZE)) {
 			LOGNOTICE("Client id %"PRId64" fd %d overloaded buffer without EOL, disconnecting",
 				client->id, client->fd);
 			return false;
 		}
 		client->buf = realloc(client->buf, round_up_page(client->bufofs + MAX_MSGSIZE + 1));
+		if (unlikely(!client->buf)) {
+			LOGERR("Client id %"PRId64" failed to grow remote recv buffer", client->id);
+			return false;
+		}
 	}
 	/* This read call is non-blocking since the socket is set to O_NOBLOCK */
 	ret = read(client->fd, client->buf + client->bufofs, MAX_MSGSIZE);
@@ -568,7 +976,8 @@ reparse:
 
 	/* Do something useful with this message now */
 	buflen = eol - client->buf + 1;
-	if (unlikely(buflen > MAX_MSGSIZE && !client->remote)) {
+	if (unlikely(buflen > MAX_MSGSIZE &&
+		     (!client->remote || buflen > MAX_REMOTE_MSGSIZE))) {
 		LOGNOTICE("Client id %"PRId64" fd %d message oversize, disconnecting", client->id, client->fd);
 		return false;
 	}
@@ -599,15 +1008,29 @@ reparse:
 			if (unlikely(!(subclient_id >= 0 && subclient_id < 4294967296.0)))
 				subclient_id = 0;
 			passthrough_id = (client->id << 32) | (int64_t)subclient_id;
-			yyjson_mut_obj_remove_key(root, "client_id");
+			/* Strip only after reading the remotely supplied subclient
+			 * id above, which is a legitimate input on this path. */
+			strip_reserved_keys(root, false);
 			yyjson_mut_obj_add_sint(doc, root, "client_id", passthrough_id);
 		} else {
-			if (ckpool.redirector && !client->redirected && strstr(client->buf, "mining.submit"))
-				parse_redirector_share(cdata, client, root);
+			if (ckpool.redirector) {
+				const char *method = yyjson_mut_get_str(
+					yyjson_mut_obj_get(root, "method"));
+
+				if (method && !safecmp(method, "mining.submit"))
+					parse_redirector_share(cdata, client, root);
+			}
+			strip_reserved_keys(root, true);
 			yyjson_mut_obj_add_sint(doc, root, "client_id", client->id);
 			yyjson_mut_obj_add_str(doc, root, "address", client->address_name);
 		}
 		yyjson_mut_obj_add_sint(doc, root, "server", client->server);
+
+		/* This peer has delivered a complete, parseable message so it
+		 * is speaking the protocol and is no longer reapable as idle. */
+		ck_wlock(&cdata->lock);
+		client->got_msg = true;
+		ck_wunlock(&cdata->lock);
 
 		/* Do not send messages of clients we've already dropped. We
 		 * do this unlocked as the occasional false negative can be
@@ -647,6 +1070,18 @@ static client_instance_t *ref_client_by_id(cdata_t *cdata, int64_t id)
 	ck_wunlock(&cdata->lock);
 
 	return client;
+}
+
+/* Safely drop a client from a context that does not already hold a reference
+ * to it, taking one for the duration. */
+static void drop_client_by_id(cdata_t *cdata, const int64_t id)
+{
+	client_instance_t *client = ref_client_by_id(cdata, id);
+
+	if (unlikely(!client))
+		return;
+	invalidate_client(cdata, client);
+	dec_instance_ref(cdata, client);
 }
 
 static void add_remote_client(cdata_t *cdata, int64_t id)
@@ -745,10 +1180,122 @@ outnoclient:
 	free(event);
 }
 
+/* Seconds a connected socket may go without delivering a single complete
+ * protocol message before it is reaped, matching the stratifier's existing
+ * policy for clients that connect but never authorise. */
+#define IDLE_ACCEPT_TIMEOUT 60
+/* Maximum clients reaped per sweep. Any remainder is caught on the next pass,
+ * which keeps the instance lock held briefly and avoids allocating under it. */
+#define IDLE_REAP_BATCH 128
+
+/* True if this socket has outlived its pre-session deadline. Caller holds
+ * cdata->lock so event-worker phase transitions cannot race this snapshot.
+ * timeout/why are populated on true (and on SV2 true-paths) for the reap log. */
+static bool client_pre_session_expired(const client_instance_t *client,
+				       time_t now_t, int *timeout,
+				       const char **why)
+{
+#ifdef HAVE_SV2
+	if (client->sv2) {
+		bool hs_inflight = !client->sv2_noise_done;
+
+		if (likely(client->sv2_has_channel))
+			return false;
+		if (hs_inflight)
+			*why = "without completing Noise handshake";
+		else if (!client->sv2_setup_time)
+			*why = "without SetupConnection";
+		else
+			*why = client->sv2_jd ? "without allocating a job token" :
+						"without opening a channel";
+		return sv2_pre_session_expired(hs_inflight, client->sv2_setup_time,
+					       client->sv2_has_channel,
+					       client->accept_time, now_t, timeout);
+	}
+#endif
+	*timeout = IDLE_ACCEPT_TIMEOUT;
+	*why = "without a message";
+	if (likely(client->got_msg))
+		return false;
+	return now_t - client->accept_time > IDLE_ACCEPT_TIMEOUT;
+}
+
+/* Reap sockets that connected but have never become a real session.
+ * A stratum_instance_t is only created once a whole message reaches the
+ * stratifier, so these are invisible to the stratifier's unauthorised client
+ * reaper while still holding an fd and a maxclients slot - and for SV2, a slot
+ * in the global handshake inflight limit, which dropping the client releases
+ * via sv2_conn_free. SV2 is three-phase: Noise (10s from accept),
+ * SetupConnection (60s from accept), then channel/token (60s from Success). */
+static void reap_idle_clients(cdata_t *cdata)
+{
+	int64_t ids[IDLE_REAP_BATCH];
+	client_instance_t *client, *tmp;
+	time_t now_t = time(NULL);
+	int nids = 0, i, timeout;
+	const char *why;
+
+	ck_rlock(&cdata->lock);
+	HASH_ITER(hh, cdata->clients, client, tmp) {
+		if (client->invalid)
+			continue;
+		if (likely(!client_pre_session_expired(client, now_t, &timeout, &why)))
+			continue;
+		ids[nids++] = client->id;
+		if (unlikely(nids >= IDLE_REAP_BATCH))
+			break;
+	}
+	ck_runlock(&cdata->lock);
+
+	for (i = 0; i < nids; i++) {
+		bool expired;
+
+		client = ref_client_by_id(cdata, ids[i]);
+		if (unlikely(!client))
+			continue;
+		int fd = -1;
+
+		/* The final phase check and invalidation are one atomic operation
+		 * against event-worker progress updates. */
+		ck_wlock(&cdata->lock);
+		expired = client_pre_session_expired(client, now_t, &timeout, &why);
+		if (expired)
+			fd = __drop_client(cdata, client);
+		ck_wunlock(&cdata->lock);
+		if (!expired) {
+			dec_instance_ref(cdata, client);
+			continue;
+		}
+		/* A concurrent invalidator may have won before the write lock. */
+		if (fd < 0) {
+			dec_instance_ref(cdata, client);
+			continue;
+		}
+		LOGNOTICE("Reaping client id %"PRId64" %s idle %s for %d seconds",
+			  client->id, client->address_name, why, timeout);
+		finish_invalidate_client(cdata, client, fd);
+		dec_instance_ref(cdata, client);
+	}
+}
+
+static void expire_redirector_shares(cdata_t *cdata)
+{
+	client_instance_t *client, *tmp;
+	time_t now_t = time(NULL);
+
+	ck_wlock(&cdata->lock);
+	HASH_ITER(hh, cdata->clients, client, tmp) {
+		if (client->shares)
+			__expire_redir_shares(cdata, client, now_t);
+	}
+	ck_wunlock(&cdata->lock);
+}
+
 /* Waits on fds ready to read on from the list stored in conn_instance and
  * handles the incoming messages */
 static void *receiver(void *arg)
 {
+	time_t last_reap = time(NULL);
 	cdata_t *cdata = (cdata_t *)arg;
 	struct epoll_event *event = ckzalloc(sizeof(struct epoll_event));
 	uint64_t serverfds, i;
@@ -780,10 +1327,21 @@ static void *receiver(void *arg)
 
 	while (42) {
 		uint64_t edu64;
+		time_t now_t;
 
 		while (unlikely(!cdata->accept))
 			cksleep_ms(10);
 		ret = epoll_wait(epfd, event, 1, 1000);
+		/* The epoll timeout gives us a roughly once per second tick to
+		 * sweep idle sockets on without a dedicated thread. Rate limit
+		 * it since a busy pool returns from epoll_wait immediately. */
+		now_t = time(NULL);
+		if (now_t != last_reap) {
+			last_reap = now_t;
+			reap_idle_clients(cdata);
+			if (ckpool.redirector)
+				expire_redirector_shares(cdata);
+		}
 		if (unlikely(ret < 1)) {
 			if (unlikely(ret == -1)) {
 				LOGEMERG("FATAL: Failed to epoll_wait in receiver");
@@ -828,6 +1386,31 @@ static bool send_sender_send(cdata_t *cdata, sender_send_t *sender_send)
 	client->sending = sender_send;
 	now_t = time(NULL);
 
+#ifdef HAVE_SV2
+	/* Noise outbound encrypt runs only here — the csender shard is the
+	 * single writer for this client's send CipherState. Encrypt once on
+	 * first attempt (before any partial write). */
+	if (sender_send->sv2_encrypt) {
+		uint8_t *ct = NULL;
+		size_t ctlen = 0;
+
+		if (!client->sv2c ||
+		    !sv2_conn_encrypt(client->sv2c, (const uint8_t *)sender_send->buf,
+				      (size_t)sender_send->len, &ct, &ctlen)) {
+			LOGINFO("SV2 encrypt failed client %"PRId64" on sender shard, dropping",
+				client->id);
+			sender_send->sv2_encrypt = false;
+			invalidate_client(cdata, client);
+			goto out_true;
+		}
+		dealloc(sender_send->buf);
+		sender_send->buf = (char *)ct;
+		sender_send->len = (int)ctlen;
+		sender_send->ofs = 0;
+		sender_send->sv2_encrypt = false;
+	}
+#endif
+
 	/* Increase sendbufsize to match large messages sent to clients - this
 	 * usually only applies to clients as mining nodes. */
 	if (unlikely(!ckpool.wmem_warn && sender_send->len > client->sendbufsize))
@@ -865,7 +1448,18 @@ out_true:
 
 static void clear_sender_send(sender_send_t *sender_send, cdata_t *cdata)
 {
-	dec_instance_ref(cdata, sender_send->client);
+	client_instance_t *client = sender_send->client;
+	csender_t *cs = &cdata->csenders[(uint64_t)client->id % cdata->nsenders];
+
+	/* Reverse the accounting taken in queue_sender_send under the same
+	 * lock that applied it. */
+	mutex_lock(&cs->lock);
+	client->queued_bytes -= sender_send->qlen;
+	if (unlikely(client->queued_bytes < 0))
+		client->queued_bytes = 0;
+	mutex_unlock(&cs->lock);
+
+	dec_instance_ref(cdata, client);
 	free(sender_send->buf);
 	free(sender_send);
 }
@@ -924,16 +1518,55 @@ static void *sender(void *arg)
 /* Append a pending send to the shard owning this client (client id modulo
  * nsenders) and wake that sender thread. A given client always maps to the
  * same shard, keeping its send state single-writer. */
-static void queue_sender_send(cdata_t *cdata, const client_instance_t *client,
+/* Bytes queued but unsent to one client before it is considered unable to keep
+ * up and dropped. Node and trusted remote peers legitimately receive far larger
+ * messages than a miner so they get a higher ceiling. Both are overridden by
+ * the maxsendqueue config option. */
+#define DEFAULT_SENDQUEUE_LIMIT (1024 * 1024)
+#define REMOTE_SENDQUEUE_LIMIT (64 * 1024 * 1024)
+
+static int64_t client_sendqueue_limit(const client_instance_t *client)
+{
+	int64_t limit;
+
+	if (ckpool.maxsendqueue > 0)
+		return ckpool.maxsendqueue;
+	if (client->remote || client->passthrough)
+		return REMOTE_SENDQUEUE_LIMIT;
+	/* Scale with the socket send buffer so clients on fat links are not
+	 * penalised, with a floor for the common case. */
+	limit = (int64_t)client->sendbufsize * 4;
+	if (limit < DEFAULT_SENDQUEUE_LIMIT)
+		limit = DEFAULT_SENDQUEUE_LIMIT;
+	return limit;
+}
+
+static void queue_sender_send(cdata_t *cdata, client_instance_t *client,
 			      sender_send_t *sender_send)
 {
 	csender_t *cs = &cdata->csenders[(uint64_t)client->id % cdata->nsenders];
+	int64_t queued;
+
+	sender_send->qlen = sender_send->len;
 
 	mutex_lock(&cs->lock);
 	cs->sends_generated++;
+	client->queued_bytes += sender_send->qlen;
+	queued = client->queued_bytes;
 	DL_APPEND(cs->sends, sender_send);
 	pthread_cond_signal(&cs->cond);
 	mutex_unlock(&cs->lock);
+
+	/* A client that reads just enough to keep resetting the blocked
+	 * timeout can otherwise accumulate queued messages without bound, so
+	 * cap the queue independently of blocked_time. Drop outside the send
+	 * lock as invalidate_client takes the instance lock. */
+	if (unlikely(queued > client_sendqueue_limit(client) && !client->invalid)) {
+		LOGNOTICE("Client id %"PRId64" fd %d %s exceeded send queue limit with %"PRId64
+			  " bytes queued, disconnecting", client->id, client->fd,
+			  client->address_name, queued);
+		drop_client_by_id(cdata, client->id);
+	}
 }
 
 static int add_redirect(cdata_t *cdata, client_instance_t *client)
@@ -969,8 +1602,15 @@ static void redirect_client(client_instance_t *client)
 	char *buf;
 	int num;
 
-	/* Set the redirected boool to only try redirecting them once */
+	/* Latch once under the same lock used by redirect/share state. */
+	ck_wlock(&cdata->lock);
+	if (client->redirected || !client->authorised) {
+		ck_wunlock(&cdata->lock);
+		return;
+	}
 	client->redirected = true;
+	__free_redir_shares(cdata, client);
+	ck_wunlock(&cdata->lock);
 
 	num = add_redirect(cdata, client);
 	doc = yyjson_mut_pack("{snsss[ssi]}", "id", "method", "client.reconnect",
@@ -988,13 +1628,14 @@ static void redirect_client(client_instance_t *client)
 }
 
 /* Look for accepted shares in redirector mode to know we can redirect this
- * client to a protected server. */
+ * client to a protected server. Any matching in-flight id is dropped, accepted
+ * or not, so rejected replies cannot pin the list. */
 static bool test_redirector_shares(cdata_t *cdata, client_instance_t *client, const char *buf)
 {
 	yyjson_doc *doc = yyjson_read(buf, strlen(buf), 0);
-	share_t *share, *found = NULL;
-	yyjson_val *val;
-	bool ret = false;
+	share_t *share, *tmp;
+	yyjson_val *val, *res_val;
+	bool ret = false, found = false, result = false;
 	int64_t id;
 
 	if (!doc) {
@@ -1008,54 +1649,46 @@ static bool test_redirector_shares(cdata_t *cdata, client_instance_t *client, co
 		goto out;
 	}
 
-	ck_rlock(&cdata->lock);
-	DL_FOREACH(client->shares, share) {
+	res_val = yyjson_obj_get(val, "result");
+	if (!yyjson_is_bool(res_val)) {
+		yyjson_val *err_val = yyjson_obj_get(val, "error");
+
+		if (unlikely(!(yyjson_is_null(res_val) && err_val && !yyjson_is_null(err_val)))) {
+			LOGINFO("Failed to find result in trs share");
+			goto out;
+		}
+		result = false;
+	} else
+		result = yyjson_get_bool(res_val);
+	if (!yyjson_is_null(yyjson_obj_get(val, "error"))) {
+		LOGINFO("Got error for trs share");
+		result = false;
+	}
+
+	ck_wlock(&cdata->lock);
+	if (!client->authorised || client->redirected) {
+		ck_wunlock(&cdata->lock);
+		goto out;
+	}
+	__expire_redir_shares(cdata, client, time(NULL));
+	DL_FOREACH_SAFE(client->shares, share, tmp) {
 		if (share->id == id) {
 			LOGDEBUG("Found matching share %"PRId64" in trs for client %"PRId64,
 				 id, client->id);
-			found = share;
+			__unlink_redir_share(cdata, client, share);
+			found = true;
 			break;
 		}
 	}
-	ck_runlock(&cdata->lock);
-
-	if (found) {
-		bool result = false;
-
-		{
-			yyjson_val *res_val = yyjson_obj_get(val, "result");
-
-			if (!yyjson_is_bool(res_val)) {
-				yyjson_val *err_val = yyjson_obj_get(val, "error");
-
-				if (unlikely(!(yyjson_is_null(res_val) && err_val && !yyjson_is_null(err_val)))) {
-					LOGINFO("Failed to find result in trs share");
-					goto out;
-				}
-				result = false;
-			} else
-				result = yyjson_get_bool(res_val);
-		}
-		if (!yyjson_is_null(yyjson_obj_get(val, "error"))) {
-			LOGINFO("Got error for trs share");
-			goto out;
-		}
-		if (!result) {
-			LOGDEBUG("Rejected trs share");
-			goto out;
-		}
+	if (found && result) {
 		LOGNOTICE("Found accepted share for client %"PRId64" - redirecting",
 			   client->id);
+		__free_redir_shares(cdata, client);
 		ret = true;
-
-		/* Clear the list now since we don't need it any more */
-		ck_wlock(&cdata->lock);
-		DL_FOREACH_SAFE(client->shares, share, found) {
-			DL_DELETE(client->shares, share);
-			dealloc(share);
-		}
-		ck_wunlock(&cdata->lock);
 	}
+	ck_wunlock(&cdata->lock);
+	if (found && !result)
+		LOGDEBUG("Rejected trs share");
 out:
 	yyjson_doc_free(doc);
 	return ret;
@@ -1117,7 +1750,14 @@ static void send_client(cdata_t *cdata, const int64_t id, char *buf)
 			free(buf);
 			return;
 		}
-		if (ckpool.redirector && !client->redirected && client->authorised) {
+		if (ckpool.redirector) {
+			bool redirectable;
+
+			ck_rlock(&cdata->lock);
+			redirectable = client->authorised && !client->redirected;
+			ck_runlock(&cdata->lock);
+			if (!redirectable)
+				goto queue_send;
 			/* If clients match the IP of clients that have already
 			 * been whitelisted as finding valid shares then
 			 * redirect them immediately. */
@@ -1128,6 +1768,7 @@ static void send_client(cdata_t *cdata, const int64_t id, char *buf)
 		}
 	}
 
+queue_send:
 	sender_send = ckzalloc(sizeof(sender_send_t));
 	sender_send->client = client;
 	sender_send->buf = buf;
@@ -1156,6 +1797,7 @@ _send_client_yyjson(cdata_t *cdata, int64_t client_id, yyjson_mut_doc *doc,
 		yyjson_mut_doc *tmp_doc = yyjson_mut_doc_mut_copy(doc, &ckyyalc);
 		yyjson_mut_val *root = yyjson_mut_doc_get_root(tmp_doc);
 
+		strip_reserved_keys(root, true);
 		yyjson_mut_obj_add_sint(tmp_doc, root, "client_id", client_id);
 		yyjson_mut_obj_add_str(tmp_doc, root, "address", client->address_name);
 		yyjson_mut_obj_add_sint(tmp_doc, root, "server", client->server);
@@ -1415,12 +2057,23 @@ static void client_yymessage_processor(yyjson_mut_doc *doc)
 
 	/* Flag redirector clients once they've been authorised */
 	if (ckpool.redirector && (client = ref_client_by_id(cdata, client_id))) {
-		if (!client->redirected && !client->authorised) {
-			yyjson_mut_val *method_val = yyjson_mut_obj_get(root, "node.method");
-			const char *method = yyjson_mut_get_str(method_val);
+		yyjson_mut_val *method_val = yyjson_mut_obj_get(root, "node.method");
+		const char *method = yyjson_mut_get_str(method_val);
 
-			if (!safecmp(method, stratum_msgs[SM_AUTHRESULT]))
+		if (!safecmp(method, stratum_msgs[SM_AUTHRESULT])) {
+			bool authorised = yyjson_mut_is_true(
+				yyjson_mut_obj_get(root, "result"));
+
+			ck_wlock(&cdata->lock);
+			/* Only pre-authorisation request IDs are unsafe. Preserve
+			 * in-flight submits across a successful re-authorisation. */
+			if (!client->authorised && authorised)
+				__free_redir_shares(cdata, client);
+			/* Once any worker authorises successfully, a later failed
+			 * re-authentication must not revoke redirect eligibility. */
+			if (!client->redirected && authorised)
 				client->authorised = true;
+			ck_wunlock(&cdata->lock);
 		}
 		dec_instance_ref(cdata, client);
 	}
@@ -1669,106 +2322,90 @@ void *connector(void *arg)
 	proc_instance_t *pi = (proc_instance_t *)arg;
 	cdata_t *cdata = ckzalloc(sizeof(cdata_t));
 	char newurl[INET6_ADDRSTRLEN], newport[8];
-	int threads, sockd, i, tries = 0, ret;
-	const int on = 1;
+	int threads, sockd, i, tries = 0;
 
 	rename_proc(pi->processname);
 	LOGWARNING("%s connector starting", ckpool.name);
 	ckpool.cdata = cdata;
 
-	if (!ckpool.serverurls) {
-		/* No serverurls have been specified. Bind to all interfaces
-		 * on default sockets. */
-		struct sockaddr_in serv_addr;
+	/* serverurls always set in main: explicit SV1 and/or SV2, or one default SV1. */
+	cdata->serverfd = ckalloc(sizeof(int *) * ckpool.serverurls);
 
-		cdata->serverfd = ckalloc(sizeof(int *));
+	for (i = 0; i < ckpool.serverurls; i++) {
+		char oldurl[INET6_ADDRSTRLEN], oldport[8];
+		char *serverurl = ckpool.serverurl[i];
+		const char *kind = "SV1";
+		int port;
 
-		sockd = socket(AF_INET, SOCK_STREAM, 0);
-		if (sockd < 0) {
-			LOGERR("Connector failed to open socket");
+#ifdef HAVE_SV2
+		if (ckpool.server_sv2 && ckpool.server_sv2[i]) {
+			if (ckpool.server_sv2_jd && ckpool.server_sv2_jd[i])
+				kind = "SV2 Job Declaration";
+			else
+				kind = "SV2 mining";
+		}
+#endif
+		if (!url_from_serverurl(serverurl, newurl, newport)) {
+			LOGWARNING("Failed to extract resolved url from %s", serverurl);
 			goto out;
 		}
-		setsockopt(sockd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-		memset(&serv_addr, 0, sizeof(serv_addr));
-		serv_addr.sin_family = AF_INET;
-		serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-		serv_addr.sin_port = htons(ckpool.proxy ? 3334 : 3333);
-		do {
-			ret = bind(sockd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+		port = atoi(newport);
+		/* All high port servers are treated as highdiff ports (SV1 and
+		 * SV2). Mirrored by report_config() for --testconfig, which
+		 * never gets this far; keep the two rules in step. */
+		if (port > 4000 && ckpool.server_highdiff) {
+			LOGNOTICE("Highdiff server %s", serverurl);
+			ckpool.server_highdiff[i] = true;
+		}
+		sockd = ckpool.oldconnfd[i];
+		if (url_from_socket(sockd, oldurl, oldport)) {
+			if (strcmp(newurl, oldurl) || strcmp(newport, oldport)) {
+				LOGWARNING("Handed over socket url %s:%s does not match config %s:%s, creating new socket",
+					   oldurl, oldport, newurl, newport);
+				Close(sockd);
+			}
+		}
 
-			if (!ret)
+		do {
+			if (sockd > 0)
+				break;
+			sockd = bind_socket(newurl, newport);
+			if (sockd > 0)
 				break;
 			LOGWARNING("Connector failed to bind to socket, retrying in 5s");
 			sleep(5);
 		} while (++tries < 25);
-		if (ret < 0) {
+
+		if (sockd < 0) {
 			LOGERR("Connector failed to bind to socket for 2 minutes");
-			Close(sockd);
 			goto out;
 		}
-		/* Set listen backlog to larger than SOMAXCONN in case the
-		 * system configuration supports it */
 		if (listen(sockd, 8192) < 0) {
 			LOGERR("Connector failed to listen on socket");
 			Close(sockd);
 			goto out;
 		}
-		cdata->serverfd[0] = sockd;
-		url_from_socket(sockd, newurl, newport);
-		ASPRINTF(&ckpool.serverurl[0], "%s:%s", newurl, newport);
-		ckpool.serverurls = 1;
-	} else {
-		cdata->serverfd = ckalloc(sizeof(int *) * ckpool.serverurls);
-
-		for (i = 0; i < ckpool.serverurls; i++) {
-			char oldurl[INET6_ADDRSTRLEN], oldport[8];
-			char *serverurl = ckpool.serverurl[i];
-			int port;
-
-			if (!url_from_serverurl(serverurl, newurl, newport)) {
-				LOGWARNING("Failed to extract resolved url from %s", serverurl);
-				goto out;
-			}
-			port = atoi(newport);
-			/* All high port servers are treated as highdiff ports */
-			if (port > 4000) {
-				LOGNOTICE("Highdiff server %s", serverurl);
-				ckpool.server_highdiff[i] = true;
-			}
-			sockd = ckpool.oldconnfd[i];
-			if (url_from_socket(sockd, oldurl, oldport)) {
-				if (strcmp(newurl, oldurl) || strcmp(newport, oldport)) {
-					LOGWARNING("Handed over socket url %s:%s does not match config %s:%s, creating new socket",
-						   oldurl, oldport, newurl, newport);
-					Close(sockd);
-				}
-			}
-
-			do {
-				if (sockd > 0)
-					break;
-				sockd = bind_socket(newurl, newport);
-				if (sockd > 0)
-					break;
-				LOGWARNING("Connector failed to bind to socket, retrying in 5s");
-				sleep(5);
-			} while (++tries < 25);
-
-			if (sockd < 0) {
-				LOGERR("Connector failed to bind to socket for 2 minutes");
-				goto out;
-			}
-			if (listen(sockd, 8192) < 0) {
-				LOGERR("Connector failed to listen on socket");
-				Close(sockd);
-				goto out;
-			}
-			cdata->serverfd[i] = sockd;
-		}
+		cdata->serverfd[i] = sockd;
+		LOGWARNING("Bound serverurl[%d]: %s (%s)", i, serverurl, kind);
 	}
 
 	if (tries)
-		LOGWARNING("Connector successfully bound to socket");
+		LOGWARNING("Connector successfully bound after retries");
+
+#ifdef HAVE_SV2
+	/* Paths defaulted in parse_config to {socket_dir}sv2_{authority,static}.key */
+	if (ckpool.sv2urls || ckpool.sv2jdurls) {
+		const char *auth_path = ckpool.sv2_authority_key;
+		const char *stat_path = ckpool.sv2_static_key;
+
+		if (!sv2_init_server_keys(auth_path, stat_path))
+			LOGERR("SV2 Noise key init failed — SV2 clients will be rejected");
+		else
+			LOGWARNING("SV2 Noise server keys ready (auth=%s static=%s)",
+				   auth_path ? auth_path : "(null)",
+				   stat_path ? stat_path : "(null)");
+	}
+#endif
 
 	cdata->cympq = create_ckmsgq("cympq", &client_yymessage_processor);
 

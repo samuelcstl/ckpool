@@ -41,6 +41,10 @@
 #include "utlist.h"
 #include "connector.h"
 #include "generator.h"
+#ifdef HAVE_SV2
+#include "sv2_strat.h"
+#include "sv2_jd.h"
+#endif
 
 /* Consistent across all pool instances */
 static const char *workpadding = "000000800000000000000000000000000000000000000000000000000000000000000000000000000000000080020000";
@@ -107,6 +111,14 @@ struct json_params {
 };
 
 typedef struct json_params json_params_t;
+
+/* Shared sshareq item: SV1 JSON submit or SV2 binary share (same workers). */
+struct shareq_item {
+	bool is_sv2;
+	void *payload; /* json_params_t * or sv2 share job */
+};
+
+static void discard_json_params(json_params_t *jp);
 
 /* Stratum json messages with their associated client id */
 struct smsg {
@@ -310,6 +322,17 @@ struct stratum_instance {
 	bool passthrough; /* Is this a passthrough */
 	bool trusted; /* Is this a trusted remote server */
 	bool remote; /* Is this a remote client on a trusted remote server */
+	bool sv2; /* Virtual SV2 mining session (no connector TCP client) */
+
+	/* Subclient accounting, used only on a passthrough, node or trusted
+	 * parent. Every id such a parent relays is chosen by the remote end
+	 * and creates an instance of its own here, so both the number that
+	 * may exist and the rate they may appear at are bounded. */
+	int subclients; /* Live subclient instances under this parent */
+	double subclient_tokens; /* Token bucket for new subclient creation */
+	tv_t last_subclient; /* Last time the token bucket was refilled */
+	time_t subclient_warned; /* Last time refusals were logged */
+	int64_t subclient_refused; /* Refusals since they were last logged */
 };
 
 struct share {
@@ -611,8 +634,14 @@ static void generate_coinbase(workbase_t *wb)
 		len = ser_number(wb->coinb1bin + ofs, wb->height);
 	ofs += len;
 
-	/* Followed by flag */
+	/* Followed by flag. gen_gbtbase() bounds these but clamp again here
+	 * since overflowing the fixed size coinb1 arrays with them would be
+	 * fatal. */
 	len = strlen(wb->flags) / 2;
+	if (unlikely(len > MAX_GBT_FLAGS_LEN)) {
+		LOGWARNING("Truncating oversized coinbase flags of length %d", len);
+		len = MAX_GBT_FLAGS_LEN;
+	}
 	wb->coinb1bin[ofs++] = len;
 	hex2bin(wb->coinb1bin + ofs, wb->flags, len);
 	ofs += len;
@@ -1111,19 +1140,46 @@ static void add_base(sdata_t *sdata, workbase_t *wb, bool *new_block)
 {
 	sdata_t *ckp_sdata = ckpool.sdata;
 	pool_stats_t *stats = &sdata->stats;
+	/* Per-sdata last value: proxy mode has one sdata per subproxy. Comparing
+	 * against the pool-wide stat re-logged every notify when upstreams are
+	 * on different networks (mainnet + testnet thrashing the global). */
 	double old_diff = stats->network_diff;
 	workbase_t *tmp, *tmpa;
+	bool update_global;
 	int len, ret;
 
 	ts_realtime(&wb->gentime);
 	/* Stats network_diff is not protected by lock but is not a critical
-	 * value */
+	 * value. Share validation and block-solve checks always use
+	 * wb->network_diff / current_workbase->network_diff on the client's
+	 * bound sdata, so mixed-network proxies remain correct. */
 	wb->network_diff = diff_from_nbits(wb->headerbin + 72);
 	if (wb->network_diff < 1)
 		wb->network_diff = 1;
 	stats->network_diff = wb->network_diff;
-	if (stats->network_diff != old_diff)
-		LOGWARNING("Network diff set to %.1f", stats->network_diff);
+
+	/* Pool hashrate-%-of-network reporting: only the preferred parent
+	 * updates the shared copy so multi-network configs do not thrash it. */
+	update_global = !ckpool.proxy;
+	if (ckpool.proxy && sdata->subproxy) {
+		proxy_t *cur;
+
+		mutex_lock(&ckp_sdata->proxy_lock);
+		cur = ckp_sdata->proxy;
+		update_global = !cur || sdata->subproxy->parent == cur;
+		mutex_unlock(&ckp_sdata->proxy_lock);
+	}
+	if (update_global)
+		ckp_sdata->stats.network_diff = wb->network_diff;
+
+	if (wb->network_diff != old_diff) {
+		if (ckpool.proxy && sdata->subproxy)
+			LOGWARNING("Network diff set to %.1f (proxy %d:%d)",
+				   wb->network_diff, sdata->subproxy->id,
+				   sdata->subproxy->subid);
+		else
+			LOGWARNING("Network diff set to %.1f", wb->network_diff);
+	}
 	len = strlen(ckpool.logdir) + 8 + 1 + 16 + 1;
 	wb->logdir = ckzalloc(len);
 
@@ -1670,8 +1726,19 @@ static workbase_t *build_ipc_workbase(void)
 			return NULL;
 		}
 	}
-	if (cb.witness_len == sizeof(wb->coinbase_witness))
+	/* The witness commitment in the required output was computed over this
+	 * reserved value, and ipc_submit_block can only serialise a 32 byte one.
+	 * Silently leaving it zeroed on a length mismatch would build a block
+	 * that only fails at submit time, on a solve, so fall back to
+	 * getblocktemplate instead. Without a commitment nothing commits to it. */
+	if (likely(cb.witness_len == sizeof(wb->coinbase_witness)))
 		memcpy(wb->coinbase_witness, cb.witness, sizeof(wb->coinbase_witness));
+	else if (wb->insert_witness) {
+		LOGWARNING("IPC template witness reserved value is %zu bytes not %zu, using getblocktemplate",
+			   cb.witness_len, sizeof(wb->coinbase_witness));
+		clear_workbase(wb);
+		return NULL;
+	}
 
 	/* Merkle branch straight from the template — no mempool hashing. */
 	wb->yymerkle_doc = yyjson_mut_doc_new(&ckyyalc);
@@ -2458,6 +2525,7 @@ static void put_workbase(sdata_t *sdata, workbase_t *wb)
 
 #define put_remote_workbase(sdata, wb) put_workbase(sdata, wb)
 
+
 static void block_solve(yyjson_mut_doc *doc);
 static void block_reject(yyjson_mut_doc *doc);
 
@@ -2527,8 +2595,14 @@ static void submit_node_block(sdata_t *sdata, yyjson_mut_val *val)
 		uchar hash1[32];
 
 		coinbase = alloca(cblen);
-		hex2bin(coinbase, coinbasehex, cblen);
-		hex2bin(swap, swaphex, 80);
+		/* Reject corrupt hex rather than hashing uninitialised
+		 * alloca tails into a submitted block. */
+		if (unlikely(!hex2bin(coinbase, coinbasehex, cblen) ||
+			     !hex2bin(swap, swaphex, 80))) {
+			LOGWARNING("Invalid hex in node method block for jobid %"PRId64, id);
+			put_workbase(sdata, wb);
+			goto out;
+		}
 		sha256(swap, 80, hash1);
 		sha256(hash1, 32, hash);
 	} else {
@@ -2536,7 +2610,11 @@ static void submit_node_block(sdata_t *sdata, yyjson_mut_val *val)
 		 * the old format only */
 		enonce1len = wb->enonce1constlen + wb->enonce1varlen;
 		enonce1bin = alloca(enonce1len);
-		hex2bin(enonce1bin, enonce1, enonce1len);
+		if (unlikely(!hex2bin(enonce1bin, enonce1, enonce1len))) {
+			LOGWARNING("Invalid enonce1 hex in node method block for jobid %"PRId64, id);
+			put_workbase(sdata, wb);
+			goto out;
+		}
 		coinbase = alloca(wb->coinb1len + wb->enonce1constlen + wb->enonce1varlen + wb->enonce2varlen + wb->coinb2len);
 		/* Fill in the hashes */
 		share_diff(coinbase, enonce1bin, wb, nonce2, ntime32, version_mask, nonce, hash, swap, &cblen);
@@ -2661,12 +2739,15 @@ static void __disconnect_session(sdata_t *sdata, const stratum_instance_t *clien
 	sdata->disconnected_generated++;
 }
 
+static void __dec_subclients(sdata_t *sdata, const stratum_instance_t *client);
+
 /* Removes a client instance we know is on the stratum_instances list and from
  * the user client list if it's been placed on it */
 static void __del_client(sdata_t *sdata, stratum_instance_t *client)
 {
 	user_instance_t *user = client->user_instance;
 
+	__dec_subclients(sdata, client);
 	HASH_DEL(sdata->stratum_instances, client);
 	if (user) {
 		DL_DELETE2(user->clients, client, user_prev, user_next );
@@ -2689,17 +2770,34 @@ static void drop_allclients(void)
 	sdata_t *sdata = ckpool.sdata;
 	int kills = 0;
 
+#ifdef HAVE_SV2
+	/*
+	 * Virtual SV2 sessions are not connector TCP clients: tearing them
+	 * down via connector_drop_client is a no-op for Noise parents and
+	 * left the channel map pointing at dead instance_ids. Drop mining
+	 * + JD tables first (closes virtual sessions), then kill instances.
+	 */
+	sv2_strat_drop_all();
+	sv2_jd_drop_all();
+#endif
+
 	ck_wlock(&sdata->instance_lock);
 	HASH_ITER(hh, sdata->stratum_instances, client, tmp) {
 		int64_t client_id = client->id;
+		bool was_sv2 = false;
 
+#ifdef HAVE_SV2
+		was_sv2 = client->sv2;
+#endif
 		if (!client->ref) {
 			__del_client(sdata, client);
 			__kill_instance(sdata, client);
 		} else
 			client->dropped = true;
 		kills++;
-		connector_drop_client(client_id);
+		/* Virtual SV2 instances have no connector fd — skip. */
+		if (!was_sv2)
+			connector_drop_client(client_id);
 	}
 	sdata->stats.users = sdata->stats.workers = 0;
 	ck_wunlock(&sdata->instance_lock);
@@ -2901,6 +2999,26 @@ static void set_proxy_prio(sdata_t *sdata, proxy_t *proxy, const int priority)
 		check_userproxies(sdata, proxy, proxy->userid);
 }
 
+/* Free client slots on one proxy. max_clients can be INT64_MAX/2 when
+ * enonce1varlen >= 8; never return a negative free count. */
+static int64_t proxy_free_slots(const proxy_t *proxy)
+{
+	if (proxy->clients >= proxy->max_clients)
+		return 0;
+	return proxy->max_clients - proxy->clients;
+}
+
+/* Saturating add so summing several large max_clients values cannot overflow. */
+static void add_headroom(int64_t *headroom, int64_t add)
+{
+	if (add <= 0)
+		return;
+	if (*headroom >= INT64_MAX - add)
+		*headroom = INT64_MAX;
+	else
+		*headroom += add;
+}
+
 /* Set proxy to the current proxy and calculate how much headroom it has */
 static int64_t current_headroom(sdata_t *sdata, proxy_t **proxy)
 {
@@ -2914,7 +3032,7 @@ static int64_t current_headroom(sdata_t *sdata, proxy_t **proxy)
 	HASH_ITER(sh, (*proxy)->subproxies, subproxy, tmp) {
 		if (subproxy->dead)
 			continue;
-		headroom += subproxy->max_clients - subproxy->clients;
+		add_headroom(&headroom, proxy_free_slots(subproxy));
 	}
 out_unlock:
 	mutex_unlock(&sdata->proxy_lock);
@@ -2941,7 +3059,7 @@ static int64_t best_userproxy_headroom(sdata_t *sdata, const int userid)
 			if (subproxy->dead)
 				continue;
 			alive = true;
-			headroom += subproxy->max_clients - subproxy->clients;
+			add_headroom(&headroom, proxy_free_slots(subproxy));
 		}
 		/* Proxies are ordered by priority so first available will be
 		 * the best priority */
@@ -3063,8 +3181,12 @@ static proxy_t *best_proxy(sdata_t *sdata)
 
 static void check_globalproxies(sdata_t *sdata, proxy_t *proxy)
 {
+	proxy_t *best;
+
 	check_bestproxy(sdata);
-	if (proxy->parent == best_proxy(sdata)->parent)
+	best = best_proxy(sdata);
+	/* All globals may be dead during failover — no best to compare. */
+	if (best && proxy->parent == best->parent)
 		reconnect_global_clients(sdata);
 }
 
@@ -3196,20 +3318,69 @@ static void update_subscribe(const char *cmd)
 	proxy->enonce1constlen = strlen(proxy->enonce1) / 2;
 	hex2bin(proxy->enonce1bin, proxy->enonce1, proxy->enonce1constlen);
 	proxy->nonce2len = yyjson_get_sint(yyjson_obj_get(val, "nonce2len"));
+	/*
+	 * Split generator-presented nonce2len (en1var+en2 only; const pad is
+	 * already in enonce1) into per-client en1var + miner en2.
+	 * Must not map nonce2len==8 → en1var=0 (max_clients=1); use classic
+	 * auto-split for ≤8 and en2=8 first only when nonce2len > 8.
+	 */
 	if (ckpool.nonce2length) {
-		proxy->enonce1varlen = proxy->nonce2len - ckpool.nonce2length;
+		int en2 = ckpool.nonce2length;
+
+		if (en2 > 8)
+			en2 = 8;
+		if (en2 > proxy->nonce2len)
+			en2 = proxy->nonce2len;
+		if (en2 < 0)
+			en2 = 0;
+		proxy->enonce2varlen = en2;
+		proxy->enonce1varlen = proxy->nonce2len - en2;
+	} else if (proxy->nonce2len > 8) {
+		/* Large grant: en2=8 (SV1-safe), rest → en1var */
+		proxy->enonce2varlen = 8;
+		proxy->enonce1varlen = proxy->nonce2len - 8;
+	} else if (proxy->nonce2len > 7) {
+		/* Classic U=8: 4 unique + 4 miner */
+		proxy->enonce1varlen = 4;
+		proxy->enonce2varlen = proxy->nonce2len - 4;
+	} else if (proxy->nonce2len > 5) {
+		proxy->enonce1varlen = 2;
+		proxy->enonce2varlen = proxy->nonce2len - 2;
+	} else if (proxy->nonce2len > 3) {
+		proxy->enonce1varlen = 1;
+		proxy->enonce2varlen = proxy->nonce2len - 1;
+	} else if (proxy->nonce2len > 0) {
+		proxy->enonce1varlen = 0;
+		proxy->enonce2varlen = proxy->nonce2len;
+	} else {
+		proxy->enonce2varlen = 0;
+		proxy->enonce1varlen = 0;
+	}
+	/* enonce1_64 only supplies 8 unique bytes */
+	if (proxy->enonce1varlen > 8) {
+		proxy->enonce1varlen = 8;
+		proxy->enonce2varlen = proxy->nonce2len - proxy->enonce1varlen;
+	}
+	/* The combined const + var extranonce1 is written into a fixed 16 byte
+	 * enonce1bin buffer per client, so a hostile or buggy upstream that
+	 * grants a long const (up to 15) plus var could otherwise overflow it.
+	 * The generator caps const at 15 in isolation but nothing bounds the
+	 * sum. Give var only the room left after const, handing the remainder
+	 * to the miner facing enonce2. */
+	if (proxy->enonce1constlen + proxy->enonce1varlen > (int)sizeof(proxy->enonce1bin)) {
+		proxy->enonce1varlen = (int)sizeof(proxy->enonce1bin) - proxy->enonce1constlen;
 		if (proxy->enonce1varlen < 0)
 			proxy->enonce1varlen = 0;
-	} else if (proxy->nonce2len > 7)
-		proxy->enonce1varlen = 4;
-	else if (proxy->nonce2len > 5)
-		proxy->enonce1varlen = 2;
-	else if (proxy->nonce2len > 3)
-		proxy->enonce1varlen = 1;
+		proxy->enonce2varlen = proxy->nonce2len - proxy->enonce1varlen;
+		LOGWARNING("Clamped oversize extranonce1 from upstream proxy %d:%d to const %d var %d",
+			   id, subid, proxy->enonce1constlen, proxy->enonce1varlen);
+	}
+	if (proxy->enonce1varlen > 0 && proxy->enonce1varlen < 8)
+		proxy->max_clients = 1ll << (proxy->enonce1varlen * 8);
+	else if (proxy->enonce1varlen >= 8)
+		proxy->max_clients = INT64_MAX / 2;
 	else
-		proxy->enonce1varlen = 0;
-	proxy->enonce2varlen = proxy->nonce2len - proxy->enonce1varlen;
-	proxy->max_clients = 1ll << (proxy->enonce1varlen * 8);
+		proxy->max_clients = 1;
 	proxy->clients = 0;
 	ck_wunlock(&dsdata->workbase_lock);
 
@@ -3521,14 +3692,18 @@ static void generator_drop_proxy(const int64_t id, const int subid)
 }
 #endif
 
-static void free_proxy(proxy_t *proxy)
+/* Free proxy resources. Returns false if any workbase still has readcount
+ * (share/auth path holds it) — proxy must remain reachable for a later reap.
+ * When true, proxy and its sdata are freed and must not be used. */
+static bool free_proxy(proxy_t *proxy)
 {
 	sdata_t *dsdata = proxy->sdata;
+	workbase_t *pending = NULL, *wb, *tmpwb;
+	bool busy = false;
 
 	/* Delete any shares in the proxy's hashtable. */
 	if (dsdata) {
 		share_t *share, *tmpshare;
-		workbase_t *wb, *tmpwb;
 
 		mutex_lock(&dsdata->share_lock);
 		HASH_ITER(hh, dsdata->shares, share, tmpshare) {
@@ -3537,17 +3712,37 @@ static void free_proxy(proxy_t *proxy)
 		}
 		mutex_unlock(&dsdata->share_lock);
 
-		/* Do we need to check readcount here if freeing the proxy? */
+		/* Honour readcount the same way aging does — never clear a wb
+		 * still held across unlocks by a share/auth path. Check and
+		 * detach idle wbs under the same lock as get_workbase. */
 		ck_wlock(&dsdata->workbase_lock);
 		HASH_ITER(hh, dsdata->workbases, wb, tmpwb) {
+			if (wb->readcount) {
+				busy = true;
+				continue;
+			}
 			HASH_DEL(dsdata->workbases, wb);
-			clear_workbase(wb);
+			if (dsdata->current_workbase == wb)
+				dsdata->current_workbase = NULL;
+			wb->hh.next = pending;
+			pending = wb;
 		}
 		ck_wunlock(&dsdata->workbase_lock);
+
+		while (pending) {
+			wb = pending;
+			pending = (workbase_t *)wb->hh.next;
+			wb->hh.next = NULL;
+			clear_workbase(wb);
+		}
+
+		if (busy)
+			return false;
 	}
 
 	free(proxy->sdata);
 	free(proxy);
+	return true;
 }
 
 /* Remove subproxies that are flagged dead. Then see if there
@@ -3585,17 +3780,31 @@ static void reap_proxies(sdata_t *sdata)
 					   subproxy->id, subproxy->subid);
 				continue;
 			}
-			dead++;
+			/* Unlink first so concurrent lookups miss it; re-add if
+			 * free_proxy defers because workbases are still held. */
 			HASH_DELETE(sh, proxy->subproxies, subproxy);
 			proxy->subproxy_count--;
-			free_proxy(subproxy);
+			if (!free_proxy(subproxy)) {
+				HASH_ADD(sh, proxy->subproxies, subid, sizeof(int), subproxy);
+				proxy->subproxy_count++;
+				continue;
+			}
+			dead++;
 		}
 		/* Should we reap the parent proxy too?*/
 		if (!proxy->deleted || proxy->subproxy_count > 1 || proxy->bound_clients)
 			continue;
+		if (sdata->proxy == proxy)
+			sdata->proxy = NULL;
 		HASH_DELETE(sh, proxy->subproxies, proxy);
 		HASH_DELETE(hh, sdata->proxies, proxy);
-		free_proxy(proxy);
+		if (!free_proxy(proxy)) {
+			/* Parent cannot die while workbases busy — put back. */
+			HASH_ADD_INT(sdata->proxies, id, proxy);
+			HASH_ADD(sh, proxy->subproxies, subid, sizeof(int), proxy);
+			if (!sdata->proxy && proxy->global && !proxy->dead)
+				sdata->proxy = proxy;
+		}
 	}
 	mutex_unlock(&sdata->proxy_lock);
 
@@ -3610,6 +3819,24 @@ static stratum_instance_t *__instance_by_id(sdata_t *sdata, const int64_t id)
 
 	HASH_FIND_I64(sdata->stratum_instances, &id, client);
 	return client;
+}
+
+/* Enter with instance_lock held. A subclient instance is accounted for on the
+ * parent that created it so remove it from that count when it goes. The parent
+ * may already have gone, in which case there is nothing left to decrement. */
+static void __dec_subclients(sdata_t *sdata, const stratum_instance_t *client)
+{
+	stratum_instance_t *parent;
+	int64_t pass_id;
+
+	pass_id = subclient(client->id);
+	if (likely(!pass_id))
+		return;
+	parent = __instance_by_id(sdata, pass_id);
+	if (!parent)
+		return;
+	if (likely(parent->subclients > 0))
+		parent->subclients--;
 }
 
 static stratum_instance_t *instance_by_id(sdata_t *sdata, const int64_t id)
@@ -3649,10 +3876,36 @@ static inline stratum_instance_t *ref_instance_by_id(sdata_t *sdata, const int64
 	return client;
 }
 
+/* Enter with write instance_lock held. The subclients of a passthrough, node or
+ * trusted parent have no connection of their own so nothing will ever tell us
+ * they have gone once their parent has. Drop them with it instead of leaving
+ * them to be reaped one minute later. */
+static int __drop_subclients(sdata_t *sdata, const stratum_instance_t *parent)
+{
+	stratum_instance_t *client, *tmp;
+	const int64_t parent_id = parent->id;
+	int dropped = 0;
+
+	HASH_ITER(hh, sdata->stratum_instances, client, tmp) {
+		if (subclient(client->id) != parent_id)
+			continue;
+		if (!client->ref) {
+			__del_client(sdata, client);
+			__kill_instance(sdata, client);
+		} else
+			client->dropped = true;
+		dropped++;
+	}
+	return dropped;
+}
+
 static void __drop_client(sdata_t *sdata, stratum_instance_t *client, bool lazily, char **msg)
 {
 	user_instance_t *user = client->user_instance;
+	int subclients = 0;
 
+	if (unlikely(client->subclients))
+		subclients = __drop_subclients(sdata, client);
 	if (unlikely(client->node))
 		DL_DELETE2(sdata->node_instances, client, node_prev, node_next);
 	else if (unlikely(client->trusted))
@@ -3673,6 +3926,9 @@ static void __drop_client(sdata_t *sdata, stratum_instance_t *client, bool lazil
 				 client->identity, client->address, client->workername,
 				 lazily ? "lazily" : "");
 		}
+	} else if (unlikely(subclients)) {
+		ASPRINTF(msg, "Dropped %s %s with %d subclients %s", client->identity,
+			 client->address, subclients, lazily ? "lazily" : "");
 	} else {
 		/* Workerless client. Too noisy to log them all */
 	}
@@ -3737,8 +3993,8 @@ static stratum_instance_t *__recruit_stratum_instance(sdata_t *sdata)
 static stratum_instance_t *__stratum_add_instance(int64_t id, const char *address,
 						  int server)
 {
+	stratum_instance_t *client, *old_client;
 	sdata_t *sdata = ckpool.sdata;
-	stratum_instance_t *client;
 	int64_t pass_id;
 
 	client = __recruit_stratum_instance(sdata);
@@ -3750,9 +4006,11 @@ static stratum_instance_t *__stratum_add_instance(int64_t id, const char *addres
 
 	client->id = id;
 	client->session_id = ++sdata->session_id;
-	strcpy(client->address, address);
-	/* Sanity check to not overflow lookup in ckpool.serverurl[] */
-	if (server >= ckpool.serverurls)
+	snprintf(client->address, sizeof(client->address), "%s", address);
+	/* Sanity check to not overflow lookup in ckpool.serverurl[]. A negative
+	 * index would read before the allocation in the trusted[]/nodeserver[]
+	 * checks as well, so bound both ends. */
+	if (server < 0 || server >= ckpool.serverurls)
 		server = 0;
 	client->server = server;
 	client->diff = client->old_diff = ckpool.startdiff;
@@ -3789,6 +4047,16 @@ static stratum_instance_t *__stratum_add_instance(int64_t id, const char *addres
 	}
 
 	ck_wlock(&sdata->instance_lock);
+	/* The lock is dropped above so another receive thread may have created
+	 * this same id in the meantime. Adding ours as well would put a second
+	 * entry for one id in the hash, unreachable by lookup and charged twice
+	 * to its parent, so discard ours and use theirs. */
+	old_client = __instance_by_id(sdata, client->id);
+	if (unlikely(old_client)) {
+		__dec_subclients(sdata, client);
+		__kill_instance(sdata, client);
+		return old_client;
+	}
 	HASH_ADD_I64(sdata->stratum_instances, id, client);
 	return client;
 }
@@ -3825,6 +4093,123 @@ static inline bool client_active(stratum_instance_t *client)
 static inline bool remote_server(stratum_instance_t *client)
 {
 	return (client->node || client->passthrough || client->trusted);
+}
+
+/* Rate at which a parent may create new subclients, and the burst of them it
+ * may create at once after a period of not doing so. A large passthrough
+ * reconnecting every miner behind it at once is a legitimate burst, so these
+ * are set well above that and only catch sustained churn, with maxsubclients
+ * bounding how many may be live at any one time. */
+#define SUBCLIENT_RATE 1000.0
+#define SUBCLIENT_BURST 10000.0
+
+/* Only messages that legitimately begin a mining session may create an
+ * instance for a subclient id we have not seen before. Anything else from an
+ * unknown id would have been discarded by parse_method as unsubscribed
+ * anyway, so refusing to create for it costs a working miner nothing. */
+static bool subclient_creates(const char *method)
+{
+	if (unlikely(!method))
+		return false;
+	/* mining.auth matches mining.authorize, which broken clients send
+	 * before subscribing and which parse_method tolerates. */
+	return (cmdmatch(method, "mining.subscribe") || cmdmatch(method, "mining.configure") ||
+		cmdmatch(method, "mining.auth"));
+}
+
+/* Addresses of subclients are supplied by their parent passthrough rather than
+ * generated by our own connector, so they are remote input and must be
+ * validated before being stored and logged. */
+static bool valid_ip_address(const char *address)
+{
+	struct in6_addr addr;
+
+	if (unlikely(!address[0]))
+		return false;
+	return (inet_pton(AF_INET, address, &addr) == 1 ||
+		inet_pton(AF_INET6, address, &addr) == 1);
+}
+
+/* Filled in by __subclient_create_ok for the caller to act on and log once it
+ * has dropped the instance_lock. */
+struct subclient_refusal {
+	const char *reason;
+	char identity[128]; /* Identity of the parent, not the subclient */
+	int64_t refused; /* Refusals by this parent since last logged */
+	int subclients; /* Live subclients of this parent */
+	bool warn; /* Refusal is abusive rather than merely out of order */
+	bool drop; /* Tell the parent to terminate this subclient */
+};
+
+typedef struct subclient_refusal subclient_refusal_t;
+
+/* Enter and exit with the write instance_lock held. Decides whether a message
+ * from a client_id we have no instance for may create one, charging it to the
+ * parent instance when it may. Direct clients have a socket of their own and
+ * are bounded by the connector's maxclients so are always allowed; subclients
+ * exist only because a parent said so, and every part of the id is chosen by
+ * the remote end, so they are bounded here instead. */
+static bool __subclient_create_ok(sdata_t *sdata, const int64_t id, const char *method,
+				  char *address, const int alen, subclient_refusal_t *sref)
+{
+	stratum_instance_t *parent;
+	int64_t pass_id;
+	double tdiff;
+	tv_t now;
+
+	pass_id = subclient(id);
+	if (likely(!pass_id))
+		return true;
+
+	tv_time(&now);
+	parent = __instance_by_id(sdata, pass_id);
+	/* An id encoding a parent that either no longer exists or was never
+	 * entitled to relay subclients can only be stale or forged. */
+	if (unlikely(!parent || !remote_server(parent))) {
+		snprintf(sref->identity, sizeof(sref->identity), "%"PRId64, pass_id);
+		sref->reason = "unknown parent";
+		sref->drop = true;
+		return false;
+	}
+	snprintf(sref->identity, sizeof(sref->identity), "%s", parent->identity);
+	/* Use the parent's own address rather than storing and logging junk */
+	if (unlikely(!valid_ip_address(address)))
+		snprintf(address, alen, "%s", parent->address);
+	if (!subclient_creates(method)) {
+		/* Out of order rather than abusive. Discard the message but
+		 * leave the subclient alone to subscribe properly. */
+		sref->reason = method ? method : "no method";
+		return false;
+	}
+	if (unlikely(ckpool.maxsubclients && parent->subclients >= ckpool.maxsubclients)) {
+		sref->reason = "maxsubclients reached";
+		goto refused;
+	}
+	tdiff = tvdiff(&now, &parent->last_subclient);
+	parent->last_subclient = now;
+	/* A zeroed timestamp on the first subclient fills the bucket */
+	parent->subclient_tokens += tdiff * SUBCLIENT_RATE;
+	if (parent->subclient_tokens > SUBCLIENT_BURST)
+		parent->subclient_tokens = SUBCLIENT_BURST;
+	if (unlikely(parent->subclient_tokens < 1)) {
+		sref->reason = "creating subclients too fast";
+		goto refused;
+	}
+	parent->subclient_tokens--;
+	parent->subclients++;
+	return true;
+refused:
+	parent->subclient_refused++;
+	sref->drop = true;
+	/* Rate limit the warning or refusing a flood becomes the flood */
+	if (now.tv_sec > parent->subclient_warned + 60) {
+		parent->subclient_warned = now.tv_sec;
+		sref->warn = true;
+		sref->refused = parent->subclient_refused;
+		sref->subclients = parent->subclients;
+		parent->subclient_refused = 0;
+	}
+	return false;
 }
 
 /* Ask the connector asynchronously to send us dropclient commands if this
@@ -3875,6 +4260,11 @@ static void stratum_broadcast(sdata_t *sdata, yyjson_mut_doc *doc, const int msg
 			continue;
 
 		if (!client_active(client) || remote_server(client))
+			continue;
+		/* SV2 sessions are not connector clients; work is pushed via
+		 * sv2_strat_on_work_update. SV1 notify would fail send and
+		 * incorrectly drop the virtual instance. */
+		if (client->sv2)
 			continue;
 
 		/* Only send messages to whitelisted clients */
@@ -3945,12 +4335,14 @@ static void drop_client(sdata_t *sdata, const int64_t id)
 	char_entry_t *entries = NULL;
 	stratum_instance_t *client;
 	char *msg = NULL;
+	bool was_sv2 = false;
 
 	LOGINFO("Stratifier asked to drop client %"PRId64, id);
 
 	ck_wlock(&sdata->instance_lock);
 	client = __instance_by_id(sdata, id);
 	if (client) {
+		was_sv2 = client->sv2;
 		__disconnect_session(sdata, client);
 		/* If the client is still holding a reference, don't drop them
 		 * now but wait till the reference is dropped */
@@ -3963,6 +4355,10 @@ static void drop_client(sdata_t *sdata, const int64_t id)
 	}
 	ck_wunlock(&sdata->instance_lock);
 
+#ifdef HAVE_SV2
+	if (was_sv2)
+		sv2_strat_clear_instance(id);
+#endif
 	if (entries)
 		notice_msg_entries(&entries);
 	reap_proxies(sdata);
@@ -4147,9 +4543,9 @@ static void block_share_summary(sdata_t *sdata)
 static void block_solve(yyjson_mut_doc *doc)
 {
 	yyjson_mut_val *val = yyjson_mut_doc_get_root(doc);
-	char *msg, *workername = NULL;
+	char *msg, *workername = NULL, *protocol = NULL;
 	sdata_t *sdata = ckpool.sdata;
-	char cdfield[64];
+	char cdfield[64], pbuf[32] = {};
 	double diff = 0;
 	int height = 0;
 	ts_t ts_now;
@@ -4163,6 +4559,11 @@ static void block_solve(yyjson_mut_doc *doc)
 	yyjson_mut_obj_get_int(&height, val, "height");
 	yyjson_mut_obj_get_double(&diff, val, "diff");
 	yyjson_mut_obj_get_string(&workername, val, "workername");
+	/* Absent from blocks solved by a pool old enough not to send it, and
+	 * from upstream solves that have no miner of ours to attribute. */
+	yyjson_mut_obj_get_string(&protocol, val, "protocol");
+	if (protocol)
+		snprintf(pbuf, sizeof(pbuf), " on %s", protocol);
 
 	if (!workername) {
 		ASPRINTF(&msg, "Block solved by %s!", ckpool.name);
@@ -4174,7 +4575,7 @@ static void block_solve(yyjson_mut_doc *doc)
 		char *s;
 
 		ASPRINTF(&msg, "Block %d solved by %s @ %s!", height, workername, ckpool.name);
-		LOGWARNING("Solved and confirmed block %d by %s", height, workername);
+		LOGWARNING("Solved and confirmed block %d by %s%s", height, workername, pbuf);
 		user = user_by_workername(sdata, workername);
 		worker = get_worker(sdata, user, workername);
 
@@ -4628,6 +5029,8 @@ static yyjson_mut_val *clientinfo(yyjson_mut_doc *doc, const stratum_instance_t 
 	yyjson_mut_obj_add_real(doc, val, "bestdiff", client->best_diff);
 	yyjson_mut_obj_add_int(doc, val, "proxyid", client->proxyid);
 	yyjson_mut_obj_add_int(doc, val, "subproxyid", client->subproxyid);
+	/* Only ever non zero on a passthrough, node or trusted parent */
+	yyjson_mut_obj_add_int(doc, val, "subclients", client->subclients);
 
 	return val;
 }
@@ -5134,13 +5537,25 @@ static void *blockupdate(void __maybe_unused *arg)
 /* Enter holding workbase_lock and client a ref count. */
 static void __fill_enonce1data(const workbase_t *wb, stratum_instance_t *client)
 {
-	if (wb->enonce1constlen)
-		memcpy(client->enonce1bin, wb->enonce1constbin, wb->enonce1constlen);
-	if (wb->enonce1varlen) {
-		memcpy(client->enonce1bin + wb->enonce1constlen, &client->enonce1_64, wb->enonce1varlen);
-		__bin2hex(client->enonce1var, &client->enonce1_64, wb->enonce1varlen);
+	int constlen = wb->enonce1constlen, varlen = wb->enonce1varlen;
+
+	/* Defence in depth against the fixed enonce1bin buffer overflowing
+	 * should the derived lengths ever be inconsistent. var also cannot
+	 * exceed the 8 bytes of enonce1_64 it is copied from. */
+	if (unlikely(constlen > (int)sizeof(client->enonce1bin)))
+		constlen = sizeof(client->enonce1bin);
+	if (unlikely(varlen > 8))
+		varlen = 8;
+	if (unlikely(constlen + varlen > (int)sizeof(client->enonce1bin)))
+		varlen = sizeof(client->enonce1bin) - constlen;
+
+	if (constlen)
+		memcpy(client->enonce1bin, wb->enonce1constbin, constlen);
+	if (varlen) {
+		memcpy(client->enonce1bin + constlen, &client->enonce1_64, varlen);
+		__bin2hex(client->enonce1var, &client->enonce1_64, varlen);
 	}
-	__bin2hex(client->enonce1, client->enonce1bin, wb->enonce1constlen + wb->enonce1varlen);
+	__bin2hex(client->enonce1, client->enonce1bin, constlen + varlen);
 }
 
 /* Create a new enonce1 from the 64 bit enonce1_64 value, using only the number
@@ -5212,9 +5627,9 @@ static proxy_t *__best_subproxy(proxy_t *proxy)
 			continue;
 		if (!subproxy->sdata->current_workbase)
 			continue;
-		subproxy_headroom = subproxy->max_clients - subproxy->clients;
+		subproxy_headroom = proxy_free_slots(subproxy);
 
-		proxy->headroom += subproxy_headroom;
+		add_headroom(&proxy->headroom, subproxy_headroom);
 		if (subproxy_headroom > max_headroom) {
 			best = subproxy;
 			max_headroom = subproxy_headroom;
@@ -5415,7 +5830,13 @@ static yyjson_mut_doc *parse_subscribe(stratum_instance_t *client, const int64_t
 		if (userid != -1) {
 			sdata_t *user_sdata = select_sdata(ckp_sdata, userid);
 
-			if (user_sdata)
+			/* Only adopt the user's own proxy once it has work. The
+			 * check at the top of this function was made against the
+			 * sdata we started with, and a subproxy that has not yet
+			 * had its first workbase would subscribe the client
+			 * against a NULL one. Staying put costs the affinity, not
+			 * the subscription. */
+			if (user_sdata && user_sdata->current_workbase)
 				sdata = user_sdata;
 		}
 	}
@@ -5440,8 +5861,16 @@ static yyjson_mut_doc *parse_subscribe(stratum_instance_t *client, const int64_t
 			client->identity, client->enonce1_64, client->enonce1);
 	}
 
-	/* Workbases will exist if sdata->current_workbase is not NULL */
+	/* Workbases will exist if sdata->current_workbase is not NULL, but that
+	 * was tested unlocked and possibly against a different sdata, so make the
+	 * dereference safe on its own terms rather than on that promise. */
 	ck_rlock(&sdata->workbase_lock);
+	if (unlikely(!sdata->workbases)) {
+		ck_runlock(&sdata->workbase_lock);
+		LOGWARNING("Failed to provide subscription due to no workbases");
+		stratum_send_message(ckp_sdata, client, "Pool Initialising");
+		return yyjson_string("Initialising");
+	}
 	n2len = sdata->workbases->enonce2varlen;
 	sprintf(sessionid, "%08x", client->session_id);
 	doc = yyjson_mut_pack("[[[s,s]],s,i]", "mining.notify", sessionid, client->enonce1,
@@ -5707,11 +6136,17 @@ static user_instance_t *__create_user(sdata_t *sdata, const char *username)
 }
 
 
-/* Find user by username or create one if it doesn't already exist */
-static user_instance_t *get_create_user(sdata_t *sdata, const char *username, bool *new_user)
+/* Find user by username or create one if it doesn't already exist. When
+ * limited is set, refuse to create a new user once maxusers is reached and
+ * return NULL instead. Every new user is a permanent heap record plus a file
+ * under logs/users/, so paths driven by unauthenticated remote input must be
+ * limited or a client rotating usernames can exhaust memory and disk. */
+static user_instance_t *__get_create_user(sdata_t *sdata, const char *username,
+					  bool *new_user, const bool limited)
 {
 	char truncated[128];
 	user_instance_t *user;
+	bool full = false;
 
 	/* Usernames are stored in a fixed 128 byte array so truncate any that
 	 * are too long to fit, keeping lookup and creation consistent */
@@ -5724,12 +6159,26 @@ static user_instance_t *get_create_user(sdata_t *sdata, const char *username, bo
 	ck_wlock(&sdata->instance_lock);
 	HASH_FIND_STR(sdata->user_instances, username, user);
 	if (unlikely(!user)) {
-		user = __create_user(sdata, username);
-		*new_user = true;
+		if (unlikely(limited && ckpool.maxusers &&
+			     HASH_COUNT(sdata->user_instances) >= (unsigned int)ckpool.maxusers))
+			full = true;
+		else {
+			user = __create_user(sdata, username);
+			*new_user = true;
+		}
 	}
 	ck_wunlock(&sdata->instance_lock);
 
+	if (unlikely(full)) {
+		LOGWARNING("Refusing to create user %s with maxusers %d reached",
+			   username, ckpool.maxusers);
+	}
 	return user;
+}
+
+static user_instance_t *get_create_user(sdata_t *sdata, const char *username, bool *new_user)
+{
+	return __get_create_user(sdata, username, new_user, false);
 }
 
 static user_instance_t *get_user(sdata_t *sdata, const char *username)
@@ -5808,7 +6257,10 @@ static user_instance_t *generate_user(stratum_instance_t *client,
 	if (unlikely(len > 127))
 		username[127] = '\0';
 
-	user = get_create_user(sdata, username, &new_user);
+	/* Limited: this is reached directly from mining.authorize. */
+	user = __get_create_user(sdata, username, &new_user, true);
+	if (unlikely(!user))
+		return NULL;
 	worker = get_create_worker(sdata, user, workername, &new_worker);
 
 	/* Create one worker instance for combined data from workers of the
@@ -5978,6 +6430,11 @@ static bool parse_authorise(stratum_instance_t *client, yyjson_mut_val *params_v
 	}
 	pass = yyjson_mut_get_str(yyjson_mut_arr_get(params_val, 1));
 	user = generate_user(client, buf);
+	if (unlikely(!user)) {
+		*err_doc = yyjson_string("Pool user limit reached");
+		client->dropped = true;
+		goto out;
+	}
 	client->user_id = user->id;
 	ts_realtime(&now);
 	client->start_time = now.tv_sec;
@@ -6051,22 +6508,30 @@ out:
 		sdata_t *sdata = ckpool.sdata;
 		workbase_t *wb;
 
-		/* To avoid grabbing recursive lock */
+		/* To avoid grabbing recursive lock. current_workbase is NULL
+		 * until the first template arrives (bitcoind startup/IBD); the
+		 * node path reaches here without the spin-wait that protects
+		 * parse_instance_msg, so the NULL check is required. */
 		ck_wlock(&sdata->workbase_lock);
 		wb = sdata->current_workbase;
-		wb->readcount++;
+		if (likely(wb))
+			wb->readcount++;
 		ck_wunlock(&sdata->workbase_lock);
 
-		ck_wlock(&sdata->instance_lock);
-		__generate_userwb(sdata, wb, user);
-		ck_wunlock(&sdata->instance_lock);
+		if (wb) {
+			ck_wlock(&sdata->instance_lock);
+			__generate_userwb(sdata, wb, user);
+			ck_wunlock(&sdata->instance_lock);
 
-		update_solo_client(sdata, wb, client->id, user);
+			update_solo_client(sdata, wb, client->id, user);
 
-		ck_wlock(&sdata->workbase_lock);
-		wb->readcount--;
-		ck_wunlock(&sdata->workbase_lock);
+			ck_wlock(&sdata->workbase_lock);
+			wb->readcount--;
+			ck_wunlock(&sdata->workbase_lock);
+		}
 
+		/* Authorised either way; solo work arrives with the first
+		 * template if none exists yet. */
 		stratum_send_diff(sdata, client);
 	}
 	return ret;
@@ -6079,6 +6544,13 @@ static void stratum_send_diff(sdata_t *sdata, const stratum_instance_t *client)
 {
 	yyjson_mut_doc *doc;
 
+#ifdef HAVE_SV2
+	/* Virtual SV2 sessions have no connector socket — send SetTarget */
+	if (client->sv2) {
+		sv2_strat_set_instance_diff(client->id, (double)client->diff);
+		return;
+	}
+#endif
 	doc = yyjson_mut_pack("{s[I]snss}", "params", client->diff, "id", "method",
 			      "mining.set_difficulty");
 	stratum_add_yysend(sdata, doc, client->id, SM_DIFF);
@@ -6288,6 +6760,22 @@ static bool ipc_submit_block(const workbase_t *wb, const uchar *data, const char
 	memcpy(&version, data, 4);
 	memcpy(&nonce, data + 76, 4);
 
+	/* BIP141 only permits the coinbase to carry a witness when the block
+	 * has a witness commitment; without one the coinbase must be serialised
+	 * legacy or the block is rejected. generate_coinbase only emits the
+	 * commitment when insert_witness is set, so mirror that here instead of
+	 * always segwit-serialising. Any block containing a single segwit
+	 * transaction forces a commitment, so this is only reached on a
+	 * witness-free block, in practice regtest. The coinbase is already in
+	 * legacy form (version || vin || vout || locktime) so submit it as is. */
+	if (unlikely(!wb->insert_witness)) {
+		if (mining_ipc_submit_solution(wb->tmpl, version, ntime32, nonce,
+					       (const unsigned char *)coinbase,
+					       (size_t)cblen, &accepted))
+			accepted = 0;
+		return accepted;
+	}
+
 	wcb = ckalloc(cblen + 40);
 	memcpy(wcb, coinbase, 4);			/* tx version */
 	wl = 4;
@@ -6330,6 +6818,17 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	if (likely(diff < network_diff))
 		return;
 
+	/* Never submit a block whose miner supplied ntime is outside the window
+	 * bitcoind will accept - it would be rejected and the reward lost. The
+	 * callers range check ntime as well but only after this is reached, and
+	 * only to report the share level error, so gate it here where every
+	 * submission path converges. */
+	if (unlikely(ntime32 < wb->ntime32 || ntime32 > wb->ntime32 + 7000)) {
+		LOGWARNING("Not submitting block solve with out of range ntime %u vs workbase %u !",
+			   ntime32, wb->ntime32);
+		return;
+	}
+
 	LOGWARNING("Possible %sblock solve diff %lf !", stale ? "stale share " : "", diff);
 	/* Can't submit a block in proxy mode without the transactions */
 	if (!ckpool.node && wb->proxy)
@@ -6360,6 +6859,9 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	yyjson_mut_obj_add_int(doc, val, "workinfoid", wb->id);
 	yyjson_mut_obj_add_strcpy(doc, val, "username", client->user_instance->username);
 	yyjson_mut_obj_add_strcpy(doc, val, "workername", client->workername);
+	/* Which stratum the solving miner was speaking. Travels with the block
+	 * data so a trusted remote's solve is attributed the same way. */
+	yyjson_mut_obj_add_strcpy(doc, val, "protocol", client->sv2 ? "SV2" : "SV1");
 	if (ckpool.remote)
 		yyjson_mut_obj_add_int(doc, val, "clientid", client->virtualid);
 	else
@@ -6420,10 +6922,13 @@ out_nouserwb:
 	return wb->coinb2bin;
 }
 
-/* Needs to be entered with workbase readcount and client holding a ref count. */
+/* Needs to be entered with workbase readcount and client holding a ref count.
+ * If full_version is true, version_field replaces the header nVersion entirely
+ * (SV2 SubmitShares). Otherwise version_field is a BIP320 mask OR'd in (SV1). */
 static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, const workbase_t *wb,
-			      const char *nonce2, const uint32_t ntime32, uint32_t version_mask,
-			      const char *nonce, uchar *hash, const bool stale)
+			      const char *nonce2, const uint32_t ntime32, uint32_t version_field,
+			      const bool full_version, const char *nonce, uchar *hash,
+			      const bool stale)
 {
 	unsigned char merkle_root[32], merkle_sha[64];
 	uint32_t *data32, *swap32, benonce32;
@@ -6470,9 +6975,13 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 	memcpy(data, wb->headerbin, 80);
 	memcpy(data + 36, merkle_root, 32);
 
-	/* Update nVersion when version_mask is in use */
-	if (version_mask) {
-		version_mask = htobe32(version_mask);
+	/* nVersion: full replace (SV2) or BIP320 mask OR (SV1) */
+	if (full_version) {
+		data32 = (uint32_t *)data;
+		*data32 = htobe32(version_field);
+	} else if (version_field) {
+		uint32_t version_mask = htobe32(version_field);
+
 		data32 = (uint32_t *)data;
 		*data32 |= version_mask;
 	}
@@ -6497,11 +7006,676 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 	ret = diff_from_target(hash);
 
 	/* Test we haven't solved a block regardless of share status */
-	test_blocksolve(client, wb, swap, hash, ret, coinbase, cblen, nonce2, nonce, ntime32, version_mask, stale);
+	test_blocksolve(client, wb, swap, hash, ret, coinbase, cblen, nonce2, nonce, ntime32,
+			full_version ? 0 : version_field, stale);
 
 	return ret;
 }
 
+#ifdef HAVE_SV2
+#include "sv2_work.h"
+#include "sv2_strat.h"
+#include "sv2_jd.h"
+#include "connector.h"
+
+/* Round a difficulty up to the int64_t client difficulty is carried as,
+ * returning 0 for anything not usable. Bounded because a double to int64_t
+ * conversion that overflows raises FE_INVALID, which is fatal here, and SV2
+ * difficulty can be derived from a client supplied max_target. Matches the
+ * 1e18 bound suggest_diff() applies to the SV1 side. */
+static int64_t sane_diff_int64(const double diff)
+{
+	if (unlikely(!isfinite(diff) || diff < 1.0))
+		return 0;
+	if (unlikely(diff > 1e18))
+		return (int64_t)1e18;
+	return (int64_t)(diff + 0.999999);
+}
+
+bool stratifier_sv2_snapshot_work(struct sv2_work_snap *out, int64_t instance_id)
+{
+	sdata_t *sdata = ckpool.sdata;
+	workbase_t *wb = NULL;
+	stratum_instance_t *client = NULL;
+	bool ok = false;
+	int i, cb2len;
+	uchar *coinb2bin;
+
+	if (!out || !sdata)
+		return false;
+	memset(out, 0, sizeof(*out));
+
+	if (instance_id)
+		client = ref_instance_by_id(sdata, instance_id);
+
+	ck_wlock(&sdata->workbase_lock);
+	wb = sdata->current_workbase;
+	if (!wb || wb->coinb1len > (int)sizeof(out->coinb1)) {
+		ck_wunlock(&sdata->workbase_lock);
+		goto out_client;
+	}
+	wb->readcount++;
+	out->wb_id = wb->id;
+	out->version = wb->version;
+	out->ntime = wb->ntime32;
+	{
+		uint32_t nbits_be = 0;
+
+		if (strlen(wb->nbit) >= 8)
+			hex2bin(&nbits_be, wb->nbit, 4);
+		out->nbits = be32toh(nbits_be);
+	}
+	/*
+	 * wb->headerbin is ckpool "midstate" layout (same as used before
+	 * flip_80 in share hashing), not Bitcoin wire order.
+	 * SV2 U256 prev_hash must match rust-bitcoin BlockHash / consensus
+	 * header field bytes = flip_32 of the midstate prevhash region.
+	 * Sending midstate bytes unchanged makes clients mine a different
+	 * header than submission_diff → sdiff ~0 / difficulty-too-low.
+	 */
+	flip_32(out->prevhash, wb->headerbin + 4);
+	memcpy(out->coinb1, wb->coinb1bin, wb->coinb1len);
+	out->coinb1len = wb->coinb1len;
+	out->enonce1varlen = wb->enonce1varlen;
+	out->enonce2varlen = wb->enonce2varlen;
+	out->merkles = wb->merkles;
+	if (out->merkles > 16)
+		out->merkles = 16;
+	for (i = 0; i < out->merkles; i++)
+		memcpy(out->merklebin[i], wb->merklebin[i], 32);
+	ck_wunlock(&sdata->workbase_lock);
+
+	if (client) {
+		ck_wlock(&sdata->instance_lock);
+		/* Ensure solo per-user coinb2 exists for this workbase */
+		if (ckpool.btcsolo && client->user_instance &&
+		    client->user_instance->btcaddress)
+			__generate_userwb(sdata, wb, client->user_instance);
+		coinb2bin = __user_coinb2(client, wb, &cb2len);
+		if (cb2len <= (int)sizeof(out->coinb2)) {
+			memcpy(out->coinb2, coinb2bin, cb2len);
+			out->coinb2len = cb2len;
+			ok = true;
+		}
+		ck_wunlock(&sdata->instance_lock);
+	} else {
+		ck_rlock(&sdata->workbase_lock);
+		if (wb->coinb2len <= (int)sizeof(out->coinb2)) {
+			memcpy(out->coinb2, wb->coinb2bin, wb->coinb2len);
+			out->coinb2len = wb->coinb2len;
+			ok = true;
+		}
+		ck_runlock(&sdata->workbase_lock);
+	}
+	put_workbase(sdata, wb);
+out_client:
+	if (client)
+		dec_instance_ref(sdata, client);
+	return ok;
+}
+
+/* Allocate a unique extranonce prefix from the same global counter used by
+ * SV1 new_enonce1, so SV1 clients and SV2 channels can never overlap on the
+ * same workbase. Takes the first len bytes of the little-endian counter,
+ * matching __fill_enonce1data. */
+bool stratifier_sv2_alloc_enonce1(uint8_t *out, int len)
+{
+	sdata_t *sdata = ckpool.sdata;
+	uint64_t enonce1, enonce1_le;
+
+	if (!out || !sdata || len < 2 || len > 8)
+		return false;
+	ck_wlock(&sdata->instance_lock);
+	enonce1 = le64toh(sdata->enonce1_64);
+	enonce1++;
+	sdata->enonce1_64 = htole64(enonce1);
+	enonce1_le = sdata->enonce1_64;
+	ck_wunlock(&sdata->instance_lock);
+	memcpy(out, &enonce1_le, len);
+	return true;
+}
+
+bool stratifier_sv2_open_session(int64_t connector_id, uint32_t channel_id,
+				 const char *user_identity, const char *address,
+				 int server, const uint8_t *enonce1, int enonce1_len,
+				 double diff, int64_t *out_instance_id)
+{
+	sdata_t *sdata = ckpool.sdata;
+	stratum_instance_t *client;
+	user_instance_t *user;
+	int64_t id;
+	bool ret = false;
+
+	if (!sdata || !user_identity || !out_instance_id || enonce1_len < 1 ||
+	    enonce1_len > 16)
+		return false;
+
+	id = connector_newclientid();
+	*out_instance_id = id;
+
+	ck_wlock(&sdata->instance_lock);
+	client = __stratum_add_instance(id, address ? address : "sv2", server);
+	/* __stratum_add_instance drops and re-grabs lock; holds write lock on return */
+	__inc_instance_ref(client);
+	ck_wunlock(&sdata->instance_lock);
+
+	client->subscribed = true;
+	client->sv2 = true;
+	client->useragent = strdup("sv2");
+	/* Round up so advertised target (from double diff) is never stricter
+	 * than the integer share threshold. */
+	client->diff = client->old_diff = sane_diff_int64(diff);
+	if (client->diff < 1)
+		client->diff = client->old_diff = ckpool.startdiff;
+	memcpy(client->enonce1bin, enonce1, enonce1_len);
+	__bin2hex(client->enonce1, client->enonce1bin, enonce1_len);
+	if (enonce1_len <= 8)
+		memcpy(&client->enonce1_64, enonce1, enonce1_len);
+	snprintf(client->identity, sizeof(client->identity),
+		 "sv2:%"PRId64":%u", connector_id, channel_id);
+
+	user = generate_user(client, user_identity);
+	if (unlikely(!user)) {
+		LOGNOTICE("SV2 reject user %s with maxusers reached", user_identity);
+		client->dropped = true;
+		dec_instance_ref(sdata, client);
+		return false;
+	}
+	client->user_id = user->id;
+	client->workername = strdup(user_identity);
+	client->password = strdup("x");
+	client->start_time = time(NULL);
+
+	if (ckpool.btcsolo && !user->btcaddress) {
+		LOGNOTICE("SV2 solo reject invalid address user %s", user_identity);
+		client->dropped = true;
+		dec_instance_ref(sdata, client);
+		return false;
+	}
+
+	client_auth(client, user, true);
+	ret = client->authorised;
+
+	if (ret && ckpool.btcsolo) {
+		workbase_t *wb;
+
+		ck_wlock(&sdata->workbase_lock);
+		wb = sdata->current_workbase;
+		if (wb)
+			wb->readcount++;
+		ck_wunlock(&sdata->workbase_lock);
+		if (wb) {
+			ck_wlock(&sdata->instance_lock);
+			__generate_userwb(sdata, wb, user);
+			ck_wunlock(&sdata->instance_lock);
+			ck_wlock(&sdata->workbase_lock);
+			wb->readcount--;
+			ck_wunlock(&sdata->workbase_lock);
+		}
+	}
+
+	LOGNOTICE("SV2 session instance %"PRId64" user %s authorised=%d diff=%"PRId64,
+		  id, user_identity, ret, client->diff);
+	dec_instance_ref(sdata, client);
+	return ret;
+}
+
+void stratifier_sv2_close_session(int64_t instance_id)
+{
+	sdata_t *sdata = ckpool.sdata;
+	stratum_instance_t *client;
+
+	if (!sdata || !instance_id)
+		return;
+	client = ref_instance_by_id(sdata, instance_id);
+	if (!client)
+		return;
+	client->dropped = true;
+	dec_instance_ref(sdata, client);
+	sv2_strat_clear_instance(instance_id);
+}
+
+void stratifier_sv2_set_diff(int64_t instance_id, double diff)
+{
+	sdata_t *sdata = ckpool.sdata;
+	stratum_instance_t *client;
+	int64_t d;
+
+	if (!sdata || instance_id < 1)
+		return;
+	d = sane_diff_int64(diff);
+	if (d < 1)
+		return;
+	client = ref_instance_by_id(sdata, instance_id);
+	if (!client)
+		return;
+	/* Same grace as SV1 retarget: shares on pre-change workbases may still
+	 * use old_diff until the next tip/workbase. Without this, UpdateChannel
+	 * / auto-vardiff jumps cause mass difficulty-too-low on in-flight work. */
+	client->old_diff = client->diff;
+	client->diff = d;
+	ck_rlock(&sdata->workbase_lock);
+	if (sdata->current_workbase)
+		client->diff_change_job_id = sdata->current_workbase->id + 1;
+	else
+		client->diff_change_job_id = sdata->workbase_id + 1;
+	ck_runlock(&sdata->workbase_lock);
+	dec_instance_ref(sdata, client);
+}
+
+bool stratifier_sv2_tip_for_jd(uint32_t *version_out, uint32_t *ntime_out,
+			       uint32_t *nbits_out, uint8_t prevhash_header[32])
+{
+	sdata_t *sdata = ckpool.sdata;
+	workbase_t *wb;
+	uint8_t wire[80];
+	uint32_t *w32;
+
+	if (!sdata || !version_out || !ntime_out || !nbits_out || !prevhash_header)
+		return false;
+	ck_rlock(&sdata->workbase_lock);
+	wb = sdata->current_workbase;
+	if (!wb) {
+		ck_runlock(&sdata->workbase_lock);
+		return false;
+	}
+	/*
+	 * wb->headerbin is ckpool midstate layout (pre flip_80). checkBlock
+	 * needs Bitcoin wire header fields. flip_80 the tip header once and
+	 * extract version / prevhash / ntime / nbits — same transform used
+	 * before share hashing. A naïve reverse of wb->prevhash left RPC
+	 * display order in the header → checkBlock inconclusive-not-best-prevblk.
+	 */
+	flip_80(wire, wb->headerbin);
+	w32 = (uint32_t *)wire;
+	*version_out = le32toh(w32[0]);
+	memcpy(prevhash_header, wire + 4, 32);
+	*ntime_out = le32toh(w32[17]); /* offset 68 */
+	*nbits_out = le32toh(w32[18]); /* offset 72 */
+	ck_runlock(&sdata->workbase_lock);
+	return true;
+}
+
+bool stratifier_sv2_merkle_root(int64_t instance_id, uint8_t merkle_root_le[32],
+				int64_t *wb_id_out, uint32_t *version_out,
+				uint32_t *ntime_out, uint32_t *nbits_out,
+				uint8_t prevhash_out[32])
+{
+	struct sv2_work_snap snap;
+	unsigned char merkle_root[32], merkle_sha[64], *coinbase;
+	stratum_instance_t *client;
+	sdata_t *sdata = ckpool.sdata;
+	int cblen, i, en1len;
+	uint32_t *data32, *swap32;
+
+	if (!stratifier_sv2_snapshot_work(&snap, instance_id))
+		return false;
+	client = ref_instance_by_id(sdata, instance_id);
+	if (!client)
+		return false;
+	en1len = snap.enonce1varlen;
+	if (en1len < 1)
+		en1len = 4;
+
+	coinbase = alloca(snap.coinb1len + en1len + snap.enonce2varlen + snap.coinb2len);
+	memcpy(coinbase, snap.coinb1, snap.coinb1len);
+	cblen = snap.coinb1len;
+	memcpy(coinbase + cblen, client->enonce1bin, en1len);
+	cblen += en1len;
+	memset(coinbase + cblen, 0, snap.enonce2varlen);
+	cblen += snap.enonce2varlen;
+	memcpy(coinbase + cblen, snap.coinb2, snap.coinb2len);
+	cblen += snap.coinb2len;
+
+	gen_hash(coinbase, merkle_root, cblen);
+	memcpy(merkle_sha, merkle_root, 32);
+	for (i = 0; i < snap.merkles; i++) {
+		memcpy(merkle_sha + 32, snap.merklebin[i], 32);
+		gen_hash(merkle_sha, merkle_root, 64);
+		memcpy(merkle_sha, merkle_root, 32);
+	}
+	data32 = (uint32_t *)merkle_sha;
+	swap32 = (uint32_t *)merkle_root_le;
+	flip_32(swap32, data32);
+
+	if (wb_id_out)
+		*wb_id_out = snap.wb_id;
+	if (version_out)
+		*version_out = snap.version;
+	if (ntime_out)
+		*ntime_out = snap.ntime;
+	if (nbits_out)
+		*nbits_out = snap.nbits;
+	if (prevhash_out)
+		memcpy(prevhash_out, snap.prevhash, 32);
+
+	dec_instance_ref(sdata, client);
+	return true;
+}
+
+static bool new_share(sdata_t *sdata, const uchar *hash, const int64_t wb_id);
+static void check_best_diff(sdata_t *sdata, user_instance_t *user, worker_instance_t *worker,
+			    const double sdiff, stratum_instance_t *client);
+
+bool stratifier_sv2_submit_share(int64_t instance_id, int64_t workbase_id,
+				 uint32_t ntime, uint32_t nonce, uint32_t version,
+				 const char *nonce2hex_in,
+				 char *errbuf, size_t errbufsz, double *sdiff_out)
+{
+	sdata_t *sdata = ckpool.sdata;
+	stratum_instance_t *client;
+	workbase_t *wb;
+	char nonce2hex[64], noncehex[16];
+	uchar hash[32];
+	double sdiff, diff;
+	bool stale = false, result = false, submit = false;
+	int n2len, expect;
+
+	if (errbuf && errbufsz)
+		errbuf[0] = '\0';
+	if (sdiff_out)
+		*sdiff_out = 0;
+
+	client = ref_instance_by_id(sdata, instance_id);
+	if (!client || !client->authorised) {
+		if (errbuf)
+			snprintf(errbuf, errbufsz, "unauthorized-worker");
+		/* null client usually means dropped after CloseChannel */
+		LOGINFO("SV2 reject instance %"PRId64" unauthorized-worker "
+			"(client=%s authorised=%d)",
+			instance_id, client ? "yes" : "null/dropped",
+			client ? client->authorised : 0);
+		if (client)
+			dec_instance_ref(sdata, client);
+		return false;
+	}
+
+	wb = get_workbase(sdata, workbase_id);
+	if (!wb) {
+		snprintf(errbuf, errbufsz, "invalid-job-id");
+		dec_instance_ref(sdata, client);
+		return false;
+	}
+	if (workbase_id < sdata->blockchange_id)
+		stale = true;
+
+	n2len = wb->enonce2varlen;
+	if (n2len < 1)
+		n2len = 1;
+	if (n2len > 31)
+		n2len = 31;
+	expect = n2len * 2;
+	if (nonce2hex_in && strlen(nonce2hex_in)) {
+		if ((int)strlen(nonce2hex_in) != expect || !validhex(nonce2hex_in)) {
+			snprintf(errbuf, errbufsz, "invalid-extranonce-size");
+			put_workbase(sdata, wb);
+			dec_instance_ref(sdata, client);
+			return false;
+		}
+		memcpy(nonce2hex, nonce2hex_in, expect + 1);
+	} else {
+		memset(nonce2hex, '0', expect);
+		nonce2hex[expect] = '\0';
+	}
+	sprintf(noncehex, "%08x", nonce);
+
+	sdiff = submission_diff(sdata, client, wb, nonce2hex, ntime, version, true,
+				noncehex, hash, stale);
+	if (sdiff_out)
+		*sdiff_out = sdiff;
+
+	if (sdiff > client->best_diff) {
+		user_instance_t *user = client->user_instance;
+		worker_instance_t *worker = client->worker_instance;
+
+		client->best_diff = sdiff;
+		LOGINFO("SV2 user %s worker %s client %s new best diff %lf",
+			user->username, worker->workername, client->identity, sdiff);
+		check_best_diff(sdata, user, worker, sdiff, client);
+	}
+
+	if (stale) {
+		snprintf(errbuf, errbufsz, "stale-share");
+		put_workbase(sdata, wb);
+		dec_instance_ref(sdata, client);
+		return false;
+	}
+	if (ntime < wb->ntime32 || ntime > wb->ntime32 + 7000) {
+		snprintf(errbuf, errbufsz, "invalid-ntime");
+		put_workbase(sdata, wb);
+		dec_instance_ref(sdata, client);
+		return false;
+	}
+
+	/* Accept min(new,old) until workbase advances past retarget (SV1 parity). */
+	diff = client->diff;
+	if (workbase_id && workbase_id < client->diff_change_job_id &&
+	    client->old_diff > 0)
+		diff = MIN(diff, (double)client->old_diff);
+	if (sdiff >= diff) {
+		if (new_share(sdata, hash, workbase_id)) {
+			result = true;
+			LOGINFO("SV2 accepted instance %"PRId64" sdiff %.1f/%.0f",
+				instance_id, sdiff, diff);
+		} else {
+			snprintf(errbuf, errbufsz, "duplicate-share");
+			result = false;
+		}
+	} else {
+		snprintf(errbuf, errbufsz, "difficulty-too-low");
+		LOGINFO("SV2 reject instance %"PRId64" difficulty-too-low sdiff %.4f need %.0f",
+			instance_id, sdiff, diff);
+		result = false;
+	}
+
+	if (sdiff >= wb->diff)
+		submit = true;
+	ck_rlock(&sdata->workbase_lock);
+	if (sdata->current_workbase &&
+	    sdiff >= sdata->current_workbase->network_diff)
+		submit = true;
+	ck_runlock(&sdata->workbase_lock);
+
+	add_submit(client, diff, result, submit);
+	put_workbase(sdata, wb);
+	dec_instance_ref(sdata, client);
+	return result;
+}
+
+/* Height of the block currently being mined, 0 if we have no workbase yet. */
+int stratifier_sv2_tip_height(void)
+{
+	sdata_t *sdata = ckpool.sdata;
+	int height = 0;
+
+	if (!sdata)
+		return 0;
+	ck_rlock(&sdata->workbase_lock);
+	if (sdata->current_workbase)
+		height = sdata->current_workbase->height;
+	ck_runlock(&sdata->workbase_lock);
+	return height;
+}
+
+double stratifier_sv2_network_diff(void)
+{
+	sdata_t *sdata = ckpool.sdata;
+	double nd = 0;
+
+	if (!sdata)
+		return 0;
+	ck_rlock(&sdata->workbase_lock);
+	if (sdata->current_workbase)
+		nd = sdata->current_workbase->network_diff;
+	ck_runlock(&sdata->workbase_lock);
+	return nd;
+}
+
+bool stratifier_sv2_account_share(int64_t instance_id, int64_t workbase_id,
+				  const unsigned char hash[32], double sdiff,
+				  char *errbuf, size_t errbufsz,
+				  bool *network_diff_met)
+{
+	sdata_t *sdata = ckpool.sdata;
+	stratum_instance_t *client;
+	double diff, network_diff = 0;
+	bool result = false, submit = false;
+	int64_t wb_id = workbase_id;
+
+	if (network_diff_met)
+		*network_diff_met = false;
+	if (errbuf && errbufsz)
+		errbuf[0] = '\0';
+	client = ref_instance_by_id(sdata, instance_id);
+	if (!client || !client->authorised) {
+		if (errbuf)
+			snprintf(errbuf, errbufsz, "unauthorized-worker");
+		if (client)
+			dec_instance_ref(sdata, client);
+		return false;
+	}
+	if (sdiff > client->best_diff) {
+		user_instance_t *user = client->user_instance;
+		worker_instance_t *worker = client->worker_instance;
+
+		client->best_diff = sdiff;
+		LOGINFO("SV2 user %s worker %s client %s new best diff %lf",
+			user->username, worker->workername, client->identity, sdiff);
+		check_best_diff(sdata, user, worker, sdiff, client);
+	}
+	if (!wb_id) {
+		ck_rlock(&sdata->workbase_lock);
+		if (sdata->current_workbase)
+			wb_id = sdata->current_workbase->id;
+		ck_runlock(&sdata->workbase_lock);
+	}
+	diff = client->diff;
+	if (wb_id && wb_id < client->diff_change_job_id && client->old_diff > 0)
+		diff = MIN(diff, (double)client->old_diff);
+	if (sdiff >= diff) {
+		if (new_share(sdata, hash, wb_id)) {
+			result = true;
+			LOGINFO("SV2 custom/accounted instance %"PRId64" sdiff %.1f/%.0f",
+				instance_id, sdiff, diff);
+		} else {
+			if (errbuf)
+				snprintf(errbuf, errbufsz, "duplicate-share");
+			result = false;
+		}
+	} else {
+		if (errbuf)
+			snprintf(errbuf, errbufsz, "difficulty-too-low");
+		result = false;
+	}
+	ck_rlock(&sdata->workbase_lock);
+	if (sdata->current_workbase) {
+		network_diff = sdata->current_workbase->network_diff;
+		if (sdiff >= sdata->current_workbase->diff)
+			submit = true;
+		if (sdiff >= network_diff)
+			submit = true;
+	}
+	ck_runlock(&sdata->workbase_lock);
+	if (network_diff_met && result && sdiff >= network_diff && network_diff > 0)
+		*network_diff_met = true;
+	add_submit(client, diff, result, submit);
+	dec_instance_ref(sdata, client);
+	return result;
+}
+
+bool stratifier_sv2_submit_block_bin(const unsigned char *block, size_t block_len,
+				     int64_t instance_id, const char *workername_opt)
+{
+	sdata_t *sdata = ckpool.sdata;
+	stratum_instance_t *client = NULL;
+	char *hex;
+	bool ret = false;
+	uchar hash1[32], hash[32], swap[32];
+	char blockhash[68] = {};
+	char *workername = NULL;
+	int height = 0;
+	double network_diff = 0;
+
+	if (!block || block_len < 80 || block_len > 4 * 1024 * 1024)
+		return false;
+	hex = ckalloc(block_len * 2 + 1);
+	__bin2hex(hex, block, block_len);
+	/* generator_submitblock expects hex block data via submit path */
+	ret = generator_submitblock(hex);
+	dealloc(hex);
+
+	/* Block hash: dsha256(wire header), display = byte-reversed */
+	{
+		int i;
+
+		sha256((uchar *)block, 80, hash1);
+		sha256(hash1, 32, hash);
+		for (i = 0; i < 32; i++)
+			swap[i] = hash[31 - i];
+		__bin2hex(blockhash, swap, 32);
+	}
+
+	ck_rlock(&sdata->workbase_lock);
+	if (sdata->current_workbase) {
+		height = sdata->current_workbase->height;
+		network_diff = sdata->current_workbase->network_diff;
+	}
+	ck_runlock(&sdata->workbase_lock);
+
+	if (workername_opt && workername_opt[0])
+		workername = strdup(workername_opt);
+	else if (instance_id > 0) {
+		client = ref_instance_by_id(sdata, instance_id);
+		if (client) {
+			if (client->workername && client->workername[0])
+				workername = strdup(client->workername);
+			else if (client->user_instance)
+				workername = strdup(client->user_instance->username);
+			dec_instance_ref(sdata, client);
+		}
+	}
+
+	if (ret) {
+		block_share_summary(sdata);
+		/* submitblock acceptance only — "confirmed" is block_solve()'s
+		 * word once the block update thread sees it on the chain. */
+		if (workername)
+			LOGWARNING("Block %d solved by %s accepted on SV2/JD",
+				   height, workername);
+		else
+			LOGWARNING("Block %d solved (SV2/JD) accepted", height);
+		LOGWARNING("SV2/JD block hash %s network_diff %.1f", blockhash, network_diff);
+		if (workername) {
+			yyjson_mut_doc *user_val, *worker_val;
+			worker_instance_t *worker;
+			user_instance_t *user;
+			char *s;
+
+			user = user_by_workername(sdata, workername);
+			if (user) {
+				worker = get_worker(sdata, user, workername);
+				ck_rlock(&sdata->instance_lock);
+				user_val = user_stats(user);
+				worker_val = worker_stats(worker);
+				ck_runlock(&sdata->instance_lock);
+				s = yyjson_mut_write(user_val, 0, NULL);
+				yyjson_mut_doc_free(user_val);
+				LOGWARNING("User %s:%s", user->username, s);
+				dealloc(s);
+				s = yyjson_mut_write(worker_val, 0, NULL);
+				yyjson_mut_doc_free(worker_val);
+				LOGWARNING("Worker %s:%s", workername, s);
+				dealloc(s);
+			}
+		}
+	} else {
+		LOGWARNING("SV2/JD block submit rejected/error height %d hash %s by %s",
+			   height, blockhash, workername ? workername : "(unknown)");
+	}
+	free(workername);
+	return ret;
+}
+#endif
 /* Optimised for the common case where shares are new */
 static bool new_share(sdata_t *sdata, const uchar *hash, const int64_t wb_id)
 {
@@ -6530,15 +7704,21 @@ static void update_client(const stratum_instance_t *client, const int64_t client
 /* Submit a share in proxy mode to the parent pool. workbase_lock is held.
  * Needs to be entered with client holding a ref count. */
 static void submit_share(stratum_instance_t *client, const int64_t jobid, const char *nonce2,
-			 const char *ntime, const char *nonce)
+			 const char *ntime, const char *nonce, const uint32_t version_mask)
 {
 	yyjson_mut_doc *doc;
-	char enonce2[32];
+	/* en1var (≤8 B) + en2 (≤8 B for SV1) → ≤32 hex chars; room for NUL. */
+	char enonce2[65];
 
-	sprintf(enonce2, "%s%s", client->enonce1var, nonce2);
-	doc = yyjson_mut_pack("{sIsssssssIsisi}", "jobid", jobid, "nonce2", enonce2,
+	snprintf(enonce2, sizeof(enonce2), "%s%s",
+		 client->enonce1var, nonce2 ? nonce2 : "");
+	/* version_mask carries the client's BIP320 version-rolling bits so an SV2
+	 * upstream proxy can reconstruct the full nVersion for SubmitSharesExtended.
+	 * SV1 upstream proxysend ignores it. */
+	doc = yyjson_mut_pack("{sIsssssssIsisisi}", "jobid", jobid, "nonce2", enonce2,
 			      "ntime", ntime, "nonce", nonce, "client_id", client->id,
-			      "proxy", client->proxyid, "subproxy", client->subproxyid);
+			      "proxy", client->proxyid, "subproxy", client->subproxyid,
+			      "version_mask", version_mask);
 	generator_add_send(doc);
 }
 
@@ -6679,8 +7859,8 @@ static bool parse_submit(stratum_instance_t *client, yyjson_mut_val *params_val,
 	wdiff = wb->diff;
 	strncpy(idstring, wb->idstring, 20);
 	ASPRINTF(&fname, "%s.sharelog", wb->logdir);
-	/* Fix broken clients sending too many chars. Nonce2 is part of the
-	 * read only json so use a temporary variable and modify it. */
+	/* Fix broken clients sending too many/few chars. Nonce2 is part of the
+	 * read-only json so use a temporary buffer sized to the workbase. */
 	len = wb->enonce2varlen * 2;
 	nlen = strlen(nonce2);
 	if (unlikely(nlen != len)) {
@@ -6689,10 +7869,15 @@ static bool parse_submit(stratum_instance_t *client, yyjson_mut_val *params_val,
 			nonce2[len] = '\0';
 		} else if (nlen < len) {
 			char *tmp = nonce2;
+			char *pad;
 
-			nonce2 = strdupa("0000000000000000");
-			memcpy(nonce2, tmp, nlen);
-			nonce2[len] = '\0';
+			/* Old code strdupa("000…") was only 16 hex (8 B) and
+			 * overflowed when enonce2varlen > 8. */
+			pad = alloca((size_t)len + 1);
+			memset(pad, '0', (size_t)len);
+			pad[len] = '\0';
+			memcpy(pad, tmp, (size_t)nlen);
+			nonce2 = pad;
 		}
 	}
 	/* Same with nonce, but we need at least 8 chars. We checked for this
@@ -6705,7 +7890,8 @@ static bool parse_submit(stratum_instance_t *client, yyjson_mut_val *params_val,
 	}
 	if (id < sdata->blockchange_id)
 		stale = true;
-	sdiff = submission_diff(sdata, client, wb, nonce2, ntime32, version_mask32, nonce, hash, stale);
+	sdiff = submission_diff(sdata, client, wb, nonce2, ntime32, version_mask32, false,
+				nonce, hash, stale);
 	if (sdiff > client->best_diff) {
 		worker_instance_t *worker = client->worker_instance;
 
@@ -6788,7 +7974,7 @@ out_nowb:
 	 * stale shares and filter out the rest. */
 	if (wb && wb->proxy && submit) {
 		LOGINFO("Submitting share upstream: %s", hexhash);
-		submit_share(client, id, nonce2, ntime, nonce);
+		submit_share(client, id, nonce2, ntime, nonce, version_mask32);
 	}
 
 	add_submit(client, diff, result, submit);
@@ -6895,6 +8081,9 @@ static void stratum_broadcast_update(sdata_t *sdata, const workbase_t *wb, const
 	ck_runlock(&sdata->workbase_lock);
 
 	stratum_broadcast(sdata, doc, SM_UPDATE);
+#ifdef HAVE_SV2
+	sv2_strat_on_work_update(clean);
+#endif
 }
 
 /* For sending a single stratum template update */
@@ -6960,6 +8149,11 @@ static void stratum_broadcast_updates(sdata_t *sdata, bool clean)
 	HASH_ITER(hh, sdata->stratum_instances, client, tmp) {
 		if (!client->user_instance)
 			continue;
+		/* Virtual SV2 sessions have no connector client; SV1 notify
+		 * would fail send and drop them. Work is pushed by
+		 * sv2_strat_on_work_update after this loop. */
+		if (client->sv2)
+			continue;
 		__inc_instance_ref(client);
 		ck_wunlock(&sdata->instance_lock);
 
@@ -6974,6 +8168,10 @@ static void stratum_broadcast_updates(sdata_t *sdata, bool clean)
 		__dec_instance_ref(client);
 	}
 	ck_wunlock(&sdata->instance_lock);
+#ifdef HAVE_SV2
+	/* Solo path never went through stratum_broadcast_update before */
+	sv2_strat_on_work_update(clean);
+#endif
 }
 
 static void send_yyjson_err(sdata_t *sdata, const int64_t client_id,
@@ -7162,7 +8360,8 @@ static void parse_method(sdata_t *sdata, stratum_instance_t *client,
 	if (likely(cmdmatch(method, "mining.submit") && client->authorised)) {
 		json_params_t *jp = create_yyjson_params(client_id, method_val, params_val, id_val);
 
-		ckmsgq_add(sdata->sshareq, jp);
+		if (!stratifier_queue_share_work(false, jp))
+			discard_json_params(jp);
 		return;
 	}
 
@@ -7242,8 +8441,8 @@ static void parse_method(sdata_t *sdata, stratum_instance_t *client,
 	if (unlikely(cmdmatch(method, "mining.passthrough"))) {
 		char buf[256];
 
-		if (ckpool.proxy || ckpool.node ) {
-			LOGNOTICE("Dropping client %s %s trying to connect as passthrough on unsupported server %d",
+		if (!ckpool.passthroughserver[client->server] || ckpool.proxy || ckpool.node) {
+			LOGNOTICE("Dropping client %s %s trying to connect as passthrough on non passthrough server %d",
 				  client->identity, client->address, client->server);
 			connector_drop_client(client_id);
 			drop_client(sdata, client_id);
@@ -7371,6 +8570,11 @@ static void parse_diff(stratum_instance_t *client, yyjson_mut_val *val)
 		LOGINFO("Discarding invalid diff %lf for client %s", diff, client->identity);
 		return;
 	}
+	/* We only really care about integer diffs so clamp the lower limit to
+	 * 1 or it will round down to zero, and a zero client diff is a divide
+	 * by zero in the vardiff calculation of add_submit(). */
+	if (unlikely(diff < 1))
+		diff = 1;
 	LOGINFO("Set client %s to diff %lf", client->identity, diff);
 	client->diff = diff;
 }
@@ -7449,6 +8653,17 @@ static user_instance_t *generate_remote_user(const char *workername)
 	username = strsep(&base_username, "._");
 	if (!username || !strlen(username))
 		username = base_username;
+	/* The username becomes a filename under logs/users/ so it must be
+	 * filtered as it is for directly connected clients in parse_authorise,
+	 * remembering the fallback above can leave separators in it. */
+	if (unlikely(!username || !strlen(username))) {
+		LOGWARNING("Empty username from remote workername %s", workername);
+		return NULL;
+	}
+	if (unlikely(strchr(username, '/') || username[0] == '.')) {
+		LOGWARNING("Invalid remote username %s", username);
+		return NULL;
+	}
 	len = strlen(username);
 	if (unlikely(len > 127))
 		username[127] = '\0';
@@ -7494,6 +8709,10 @@ static void parse_remote_share(sdata_t *sdata, yyjson_mut_val *val, const char *
 	if (unlikely(!isfinite(sdiff)))
 		sdiff = 0;
 	user = generate_remote_user(workername);
+	if (unlikely(!user)) {
+		LOGWARNING("Failed to generate user from remote message %s", buf);
+		return;
+	}
 	user->authorised = true;
 	worker = get_worker(sdata, user, workername);
 	check_best_diff(sdata, user, worker, sdiff, NULL);
@@ -7641,8 +8860,11 @@ void parse_upstream_workinfo(yyjson_mut_val *val)
 static void parse_remote_auth(sdata_t *sdata, yyjson_mut_val *val, stratum_instance_t *remote,
 			      const int64_t remote_id)
 {
+	char address[INET6_ADDRSTRLEN] = {};
 	yyjson_mut_val *params, *method, *id_val;
+	subclient_refusal_t sref = {};
 	stratum_instance_t *client;
+	bool refused = false;
 	json_params_t *jp;
 	int64_t client_id;
 
@@ -7663,13 +8885,40 @@ static void parse_remote_auth(sdata_t *sdata, yyjson_mut_val *val, stratum_insta
 	 * to drop the client id locally once we finish with it */
 	ck_wlock(&sdata->instance_lock);
 	client = __instance_by_id(sdata, client_id);
-	if (likely(!client))
-		client = __stratum_add_instance(client_id, remote->address, remote->server);
-	client->remote = true;
-	yyjson_mut_obj_strdup(&client->useragent, val, "useragent");
-	yyjson_mut_obj_strncpy(client->enonce1, val, "enonce1", sizeof(client->enonce1));
-	yyjson_mut_obj_strncpy(client->address, val, "address", sizeof(client->address));
+	if (likely(!client)) {
+		/* A remote auth is the legitimate creation trigger for a
+		 * trusted remote's subclient, but the low bits of the id are
+		 * chosen by the remote end so bound it like any other. */
+		snprintf(address, sizeof(address), "%s", remote->address);
+		if (likely(__subclient_create_ok(sdata, client_id, "mining.auth", address,
+						 sizeof(address), &sref)))
+			client = __stratum_add_instance(client_id, address, remote->server);
+		else
+			refused = true;
+	}
+	if (likely(!refused)) {
+		client->remote = true;
+		yyjson_mut_obj_strdup(&client->useragent, val, "useragent");
+		yyjson_mut_obj_strncpy(client->enonce1, val, "enonce1", sizeof(client->enonce1));
+		yyjson_mut_obj_strncpy(client->address, val, "address", sizeof(client->address));
+		/* This address is supplied by the remote server, not generated
+		 * by our own connector, so fall back to the remote's own. */
+		if (unlikely(!valid_ip_address(client->address)))
+			snprintf(client->address, sizeof(client->address), "%s", remote->address);
+	}
 	ck_wunlock(&sdata->instance_lock);
+
+	if (unlikely(refused)) {
+		if (unlikely(sref.warn)) {
+			LOGWARNING("Refusing subclients of remote %s: %s, %"PRId64" refused with %d live",
+				   sref.identity, sref.reason, sref.refused, sref.subclients);
+		} else {
+			LOGINFO("Refused subclient %"PRId64" of remote %s: %s",
+				client_id, sref.identity, sref.reason);
+		}
+		discard_json_params(jp);
+		return;
+	}
 
 	ckmsgq_add(sdata->sauthq, jp);
 }
@@ -7736,8 +8985,14 @@ static void parse_remote_block(sdata_t *sdata, yyjson_mut_doc *doc, yyjson_mut_v
 		char blockhash[68];
 
 		LOGWARNING("Possible remote block solve diff %lf !", diff);
-		hex2bin(coinbase, coinbasehex, cblen);
-		hex2bin(swap, swaphex, 80);
+		/* Same as the node block path: refuse to assemble/submit on
+		 * corrupt hex so uninitialised alloca is never hashed in. */
+		if (unlikely(!hex2bin(coinbase, coinbasehex, cblen) ||
+			     !hex2bin(swap, swaphex, 80))) {
+			LOGWARNING("Invalid hex in remote block for workinfoid %"PRId64, id);
+			put_remote_workbase(sdata, wb);
+			goto out_add;
+		}
 		sha256(swap, 80, hash1);
 		sha256(hash1, 32, hash);
 		gbt_block = process_block(wb, coinbase, cblen, swap, hash, flip32, blockhash);
@@ -7969,7 +9224,8 @@ static void node_client_msg(yyjson_mut_val *val, stratum_instance_t *client)
 		yyjson_mut_doc *err_doc;
 		case SM_SHARE:
 			jp = create_yyjson_params(client->id, method, params, id_val);
-			ckmsgq_add(sdata->sshareq, jp);
+			if (!stratifier_queue_share_work(false, jp))
+				discard_json_params(jp);
 			break;
 		case SM_SHARERESULT:
 			parse_share_result(client, res_val);
@@ -8094,12 +9350,14 @@ static void parse_instance_msg(sdata_t *sdata, smsg_t *msg, stratum_instance_t *
 
 static void srecv_process(smsg_t *msg)
 {
+	bool noid = false, dropped = false, refused = false;
 	char address[INET6_ADDRSTRLEN], *buf = NULL;
-	bool noid = false, dropped = false;
+	subclient_refusal_t sref = {};
 	yyjson_mut_val *root, *val;
 	sdata_t *sdata = ckpool.sdata;
 	stratum_instance_t *client;
 	yyjson_mut_doc *doc;
+	const char *method;
 	int server;
 
 	if (unlikely(!msg)) {
@@ -8130,7 +9388,20 @@ static void srecv_process(smsg_t *msg)
 		goto out;
 	}
 
-	msg->client_id = yyjson_mut_get_num(val);
+	/* These three keys are generated by the connector, which strips any
+	 * copy supplied by the remote end first. Validate them regardless:
+	 * passthrough and node peers also feed this path, and an unchecked
+	 * value here is a pre-auth crash. */
+	if (unlikely(!yyjson_mut_is_int(val))) {
+		buf = yyjson_mut_write(doc, 0, NULL);
+		LOGWARNING("Non integer client_id in connector json smsg %s", buf);
+		goto out;
+	}
+	msg->client_id = yyjson_mut_get_sint(val);
+	if (unlikely(msg->client_id < 0)) {
+		LOGWARNING("Negative client_id %"PRId64" in connector json smsg", msg->client_id);
+		goto out;
+	}
 	yyjson_mut_obj_clear(val);
 
 	val = yyjson_mut_obj_get(root, "address");
@@ -8139,7 +9410,17 @@ static void srecv_process(smsg_t *msg)
 		LOGWARNING("Failed to extract address from connector json smsg %s", buf);
 		goto out;
 	}
-	strcpy(address, yyjson_mut_get_str(val));
+	{
+		const char *addr = yyjson_mut_get_str(val);
+
+		if (unlikely(!addr || strlen(addr) >= sizeof(address))) {
+			LOGWARNING("Invalid address for client %"PRId64" in connector json smsg",
+				   msg->client_id);
+			connector_drop_client(msg->client_id);
+			goto out;
+		}
+		strcpy(address, addr);
+	}
 	yyjson_mut_obj_clear(val);
 
 	val = yyjson_mut_obj_get(root, "server");
@@ -8148,21 +9429,58 @@ static void srecv_process(smsg_t *msg)
 		LOGWARNING("Failed to extract server from connector json smsg %s", buf);
 		goto out;
 	}
-	server = yyjson_mut_get_num(val);
+	if (unlikely(!yyjson_mut_is_int(val))) {
+		LOGWARNING("Non integer server for client %"PRId64" in connector json smsg",
+			   msg->client_id);
+		connector_drop_client(msg->client_id);
+		goto out;
+	}
+	server = yyjson_mut_get_sint(val);
+	if (unlikely(server < 0 || server >= ckpool.serverurls)) {
+		LOGWARNING("Out of range server %d for client %"PRId64" in connector json smsg",
+			   server, msg->client_id);
+		connector_drop_client(msg->client_id);
+		goto out;
+	}
 	yyjson_mut_obj_clear(val);
+
+	/* Needed before we can decide whether an unknown id may create an
+	 * instance, and harmless to look up early for one that exists. */
+	method = yyjson_mut_get_str(yyjson_mut_obj_get(root, "method"));
 
 	/* Parse the message here */
 	ck_wlock(&sdata->instance_lock);
 	client = __instance_by_id(sdata, msg->client_id);
 	/* If client_id instance doesn't exist yet, create one */
 	if (unlikely(!client)) {
-		noid = true;
-		client = __stratum_add_instance(msg->client_id, address, server);
+		if (likely(__subclient_create_ok(sdata, msg->client_id, method, address,
+						 sizeof(address), &sref))) {
+			noid = true;
+			client = __stratum_add_instance(msg->client_id, address, server);
+			/* May be an existing instance another receive thread
+			 * created for this id while we were adding ours */
+			if (unlikely(client->dropped))
+				dropped = true;
+		} else
+			refused = true;
 	} else if (unlikely(client->dropped))
 		dropped = true;
-	if (likely(!dropped))
+	if (likely(!refused && !dropped))
 		__inc_instance_ref(client);
 	ck_wunlock(&sdata->instance_lock);
+
+	if (unlikely(refused)) {
+		if (unlikely(sref.warn)) {
+			LOGWARNING("Refusing subclients of parent %s: %s, %"PRId64" refused with %d live",
+				   sref.identity, sref.reason, sref.refused, sref.subclients);
+		} else {
+			LOGINFO("Refused subclient %"PRId64" of parent %s: %s",
+				msg->client_id, sref.identity, sref.reason);
+		}
+		if (sref.drop)
+			connector_drop_client(msg->client_id);
+		goto out;
+	}
 
 	if (unlikely(dropped)) {
 		/* Client may be NULL here */
@@ -8229,7 +9547,25 @@ static void discard_json_params(json_params_t *jp)
 	free(jp);
 }
 
-static void sshare_process(json_params_t *jp)
+/* Enqueue SV1 (json_params) or SV2 share job onto sshareq. */
+bool stratifier_queue_share_work(bool is_sv2, void *payload)
+{
+	sdata_t *sdata = ckpool.sdata;
+	struct shareq_item *si;
+
+	if (!sdata || !sdata->sshareq || !payload)
+		return false;
+	si = ckzalloc(sizeof(*si));
+	si->is_sv2 = is_sv2;
+	si->payload = payload;
+	if (!ckmsgq_add(sdata->sshareq, si)) {
+		free(si);
+		return false;
+	}
+	return true;
+}
+
+static void sshare_process_sv1(json_params_t *jp)
 {
 	enum share_err err_code = SE_NONE;
 	stratum_instance_t *client;
@@ -8271,6 +9607,21 @@ out_decref:
 	dec_instance_ref(sdata, client);
 out:
 	discard_json_params(jp);
+}
+
+static void sshare_process(struct shareq_item *si)
+{
+	if (!si)
+		return;
+#ifdef HAVE_SV2
+	if (si->is_sv2) {
+		sv2_strat_process_share_job(si->payload);
+		free(si);
+		return;
+	}
+#endif
+	sshare_process_sv1(si->payload);
+	free(si);
 }
 
 /* As ref_instance_by_id but only returns clients not authorising or authorised,
@@ -8630,7 +9981,22 @@ static void *statsupdate(void __maybe_unused *arg)
 			/* Look for clients that have been dropped which the
 			 * connector may not have been informed about and should
 			 * disconnect. */
-			if (client->dropped)
+			if (client->sv2) {
+				/*
+				 * Virtual SV2 sessions have no connector TCP client
+				 * (no dropidle / test_client), but instance dsps are
+				 * still exposed via getclient(s) — idle-decay like SV1.
+				 */
+				if (client->authorised) {
+					per_tdiff = tvdiff(&now, &client->last_share);
+					if (per_tdiff > 60) {
+						decay_client(client, 0, &now);
+						idle_workers++;
+						if (per_tdiff > 600)
+							client->idle = true;
+					}
+				}
+			} else if (client->dropped)
 				connector_drop_client(client->id);
 			else if (remote_server(client)) {
 				/* Do nothing to these */
@@ -8864,8 +10230,14 @@ static void *statsupdate(void __maybe_unused *arg)
 		fprintf(fp, "%s\n", s);
 		dealloc(s);
 
-		/* Round to 4 significant digits */
-		percent = round(stats->accounted_diff_shares * 10000 / stats->network_diff) / 100;
+		/* Round to 4 significant digits. A zero network_diff would be a
+		 * fatal divide by zero as ckpool unmasks FE_DIVBYZERO; leave
+		 * percent at 0 until the first workbase sets a real value. */
+		if (likely(stats->network_diff > 0))
+			percent = round(stats->accounted_diff_shares * 10000 /
+					stats->network_diff) / 100;
+		else
+			percent = 0;
 		doc = yyjson_mut_pack("{sf,sI,sI,sI,sf,sf,sf,sf}",
 		        "diff", percent,
 			"accepted", stats->accounted_diff_shares,
@@ -8880,6 +10252,25 @@ static void *statsupdate(void __maybe_unused *arg)
 		LOGNOTICE("Pool:%s", s);
 		fprintf(fp, "%s\n", s);
 		dealloc(s);
+
+#ifdef HAVE_SV2
+		/* Connected SV2 mining/JD client gauges (one JSON object line). */
+		s = sv2_strat_stats_json();
+		if (s) {
+			LOGNOTICE("SV2:%s", s);
+			fprintf(fp, "%s\n", s);
+			dealloc(s);
+		}
+		/* Job Declaration operator metrics (one JSON object line). */
+		if (sv2_jd_enabled()) {
+			s = sv2_jd_stats_json();
+			if (s) {
+				LOGNOTICE("SV2JD:%s", s);
+				fprintf(fp, "%s\n", s);
+				dealloc(s);
+			}
+		}
+#endif
 		fclose(fp);
 
 out_status:
@@ -9093,6 +10484,7 @@ void *throbber(void __maybe_unused *arg)
 	rename_proc("throbber");
 
 	while (42) {
+		workbase_t *wb;
 		double sdiff;
 		pool_stats_t *stats;
 		char stamp[128], hashrate[16], ch;
@@ -9105,8 +10497,13 @@ void *throbber(void __maybe_unused *arg)
 		suffix_string(stats->dsps1 * nonces, hashrate, 16, 3);
 		ch = status_chars[(counter++) & 0x3];
 		get_timestamp(stamp);
-		if (likely(sdata->current_workbase)) {
-			double bdiff = sdiff / sdata->current_workbase->network_diff * 100;
+		/* Read the workbase once: unlocked here as being transiently
+		 * wrong is harmless, but testing and dereferencing separately
+		 * is not. A zero network_diff would be a fatal divide by zero
+		 * as ckpool unmasks FE_DIVBYZERO. */
+		wb = sdata->current_workbase;
+		if (likely(wb && wb->network_diff)) {
+			double bdiff = sdiff / wb->network_diff * 100;
 
 			fprintf(stdout, "\33[2K\r%s %c %sH/s  %.1f SPS  %d users  %d workers  %.0f shares  %.1f%% diff",
 				stamp, ch, hashrate, stats->sps1, stats->users + stats->remote_users,
@@ -9390,17 +10787,30 @@ void *stratifier(void *arg)
 			create_pthread(&pth_zmqnotify, zmqnotify, NULL);
 
 #ifdef HAVE_CAPNP
-		/* Optionally generate block templates from the mining IPC
-		 * interface. The service connection runs its own thread; block
+		/* A valid ipcmining socket always implies IPC template
+		 * generation. The service connection runs its own thread; block
 		 * generation falls back to getblocktemplate when it is not
 		 * ready. */
-		if (ckpool.ipctemplate && ckpool.ipcmining && !access(ckpool.ipcmining, F_OK)) {
+		if (ckpool.ipcmining && !access(ckpool.ipcmining, F_OK)) {
 			ckpool.btc_template_svc = mining_ipc_service_connect(ckpool.ipcmining);
 			if (ckpool.btc_template_svc)
 				LOGNOTICE("Started mining IPC block template service on %s",
 					  ckpool.ipcmining);
 			else
 				LOGWARNING("Failed to start mining IPC block template service");
+#ifdef HAVE_SV2
+			/* Phase 2: dedicated validation connection for checkBlock,
+			 * only needed when SV2 is configured (JD uses checkBlock
+			 * even if templates still use RPC). */
+			if (ckpool.sv2urls || ckpool.sv2jdurls) {
+				ckpool.btc_validation_svc = mining_ipc_service_connect(ckpool.ipcmining);
+				if (ckpool.btc_validation_svc)
+					LOGNOTICE("Started mining IPC validation service (checkBlock) on %s",
+						  ckpool.ipcmining);
+				else
+					LOGWARNING("Failed to start mining IPC validation service");
+			}
+#endif
 		}
 #endif
 	}

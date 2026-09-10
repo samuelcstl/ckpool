@@ -1,4 +1,24 @@
-AC_INIT([ckpool],[1.1.1],[kernel@kolivas.org])
+AC_INIT([ckpool],[1.2.0],[kernel@kolivas.org])
+
+dnl Must come before anything that expands AC_PROG_CC/AC_PROG_CXX, which is as
+dnl early as AC_USE_SYSTEM_EXTENSIONS below. Autoconf fills in a bare "-g -O2"
+dnl the moment it detects a compiler, and a later "test -z" then sees a
+dnl non-empty value and never applies these.
+AC_MSG_CHECKING([whether to set default CFLAGS])
+if test -z "$CFLAGS"; then
+    CFLAGS="-g -O2 -Wall -march=native"
+    AC_MSG_RESULT([yes, setting default CFLAGS to $CFLAGS])
+else
+    AC_MSG_RESULT([no, using user-provided CFLAGS])
+fi
+
+AC_MSG_CHECKING([whether to set default CXXFLAGS])
+if test -z "$CXXFLAGS"; then
+    CXXFLAGS="-g -O2 -Wall -march=native"
+    AC_MSG_RESULT([yes, setting default CXXFLAGS to $CXXFLAGS])
+else
+    AC_MSG_RESULT([no, using user-provided CXXFLAGS])
+fi
 
 AC_CANONICAL_TARGET
 AC_CONFIG_MACRO_DIR([m4])
@@ -14,14 +34,6 @@ AC_CANONICAL_HOST
 
 dnl Make sure anyone changing configure.ac/Makefile.am has a clue
 AM_MAINTAINER_MODE
-
-AC_MSG_CHECKING([whether to set default CFLAGS])
-if test -z "$CFLAGS"; then
-    CFLAGS="-O2 -Wall -march=native"
-    AC_MSG_RESULT([yes, setting default CFLAGS to $CFLAGS])
-else
-    AC_MSG_RESULT([no, using user-provided CFLAGS])
-fi
 
 dnl Checks for programs
 AC_PROG_CC
@@ -109,6 +121,7 @@ dnl When present, ckpool builds the C++ IPC shim (ipc/mining) and prefers the
 dnl IPC interface for block notifications, falling back to ZMQ otherwise.
 CAPNP_CFLAGS=""
 CAPNP_LIBS=""
+CAPNP_REQ="pkg-config package capnp-rpc (e.g. libcapnp-dev), C++ compiler"
 PKG_CHECK_MODULES([CAPNP], [capnp-rpc],
   [CAPNP=yes
    AC_DEFINE([HAVE_CAPNP], [1], [Have Cap'n Proto (capnp-rpc) for the mining IPC interface])],
@@ -116,6 +129,61 @@ PKG_CHECK_MODULES([CAPNP], [capnp-rpc],
 AC_SUBST(CAPNP_CFLAGS)
 AC_SUBST(CAPNP_LIBS)
 AM_CONDITIONAL([HAVE_CAPNP], [test x$CAPNP = xyes])
+
+dnl Optional Stratum V2 (Mining Protocol) — requires libsodium and bundled
+dnl libsecp256k1 with ellswift + schnorrsig (see src/secp256k1).
+AC_ARG_ENABLE([sv2],
+  [AS_HELP_STRING([--enable-sv2], [build Stratum V2 support (default: check deps)])],
+  [enable_sv2=$enableval], [enable_sv2=auto])
+
+SV2=no
+SV2_CFLAGS=""
+SV2_LIBS=""
+have_sodium=no
+have_secp_src=no
+SV2_MISSING=""
+if test "x$enable_sv2" = "xno"; then
+  SV2_MISSING="disabled (--disable-sv2)"
+else
+  PKG_CHECK_MODULES([SODIUM], [libsodium], [have_sodium=yes], [have_sodium=no])
+  if test "x$have_sodium" = "xno"; then
+    AC_CHECK_HEADER([sodium.h], [have_sodium=yes], [have_sodium=no])
+    if test "x$have_sodium" = "xyes"; then
+      SODIUM_LIBS="-lsodium"
+    fi
+  fi
+  if test -f "$srcdir/src/secp256k1/include/secp256k1_ellswift.h" && \
+     test -f "$srcdir/src/secp256k1/include/secp256k1_schnorrsig.h"; then
+    have_secp_src=yes
+  else
+    have_secp_src=no
+  fi
+  if test "x$have_sodium" = "xyes" && test "x$have_secp_src" = "xyes"; then
+    SV2=yes
+    AC_DEFINE([HAVE_SV2], [1], [Build Stratum V2 support])
+    SV2_CFLAGS="$SODIUM_CFLAGS -I\$(top_srcdir)/src/secp256k1/include"
+    SV2_LIBS="$SODIUM_LIBS \$(top_builddir)/src/secp256k1/.libs/libsecp256k1.a"
+  else
+    missing=""
+    if test "x$have_sodium" != "xyes"; then
+      missing="libsodium (pkg-config libsodium or sodium.h + -lsodium)"
+    fi
+    if test "x$have_secp_src" != "xyes"; then
+      if test -n "$missing"; then
+        missing="$missing; "
+      fi
+      missing="${missing}src/secp256k1 with ellswift+schnorrsig (secp256k1_ellswift.h, secp256k1_schnorrsig.h)"
+    fi
+    SV2_MISSING="$missing"
+    if test "x$enable_sv2" = "xyes"; then
+      AC_MSG_ERROR([--enable-sv2 requires: $SV2_MISSING])
+    fi
+    SV2=no
+  fi
+fi
+AC_SUBST(SV2_CFLAGS)
+AC_SUBST(SV2_LIBS)
+AM_CONDITIONAL([HAVE_SV2], [test x$SV2 = xyes])
 
 AC_CONFIG_FILES([Makefile src/Makefile test/Makefile])
 
@@ -127,9 +195,27 @@ echo
 echo "Compilation............: make (or gmake)"
 echo "  YASM (Intel ASM).....: $YASM"
 echo "  ZMQ..................: $ZMQ"
-echo "  CAPNP (mining IPC)...: $CAPNP"
+if test "x$CAPNP" = "xyes"; then
+  echo "  IPC (mining Cap'n)...: yes"
+else
+  echo "  IPC (mining Cap'n)...: no"
+  echo "    requires...........: $CAPNP_REQ"
+fi
+if test "x$SV2" = "xyes"; then
+  echo "  SV2 (Stratum V2).....: yes"
+else
+  echo "  SV2 (Stratum V2).....: no"
+  if test -n "$SV2_MISSING"; then
+    echo "    requires...........: $SV2_MISSING"
+  else
+    echo "    requires...........: libsodium; src/secp256k1 with ellswift+schnorrsig"
+  fi
+fi
 echo "  CPPFLAGS.............: $CPPFLAGS"
 echo "  CFLAGS...............: $CFLAGS"
+if test "x$CAPNP" = "xyes"; then
+  echo "  CXXFLAGS.............: $CXXFLAGS"
+fi
 echo "  LDFLAGS..............: $LDFLAGS"
 echo "  LDADD................: $LIBS"
 echo "  ARCHITECTURE.........: $host_cpu $x86_shani$rorx$avx1$sse4$sha2"

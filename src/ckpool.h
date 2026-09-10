@@ -163,10 +163,24 @@ struct ckpool_instance {
 	int *oldconnfd;
 	/* Should we inherit a running instance's socket and shut it down */
 	bool handover;
+
+	/* Parse and validate the configuration, report it, and exit */
+	bool testconfig;
 	/* How many clients maximum to accept before rejecting further */
 	int maxclients;
 	/* Drop clients that have been idle for this many seconds, 0 to disable */
 	int dropidle;
+	/* Maximum bytes queued but unsent to one client before dropping it, 0
+	 * to use the per client derived default */
+	int64_t maxsendqueue;
+	/* Maximum distinct users to create from authorisations, 0 to disable */
+	int maxusers;
+	/* Maximum concurrent subclient instances one passthrough, node or
+	 * trusted remote parent may create, 0 to disable */
+	int maxsubclients;
+	/* Honour client.reconnect requests from the upstream pool (proxy mode).
+	 * Defaults to true; set false to refuse all upstream redirects. */
+	bool reconnect;
 
 	/* API message queue */
 	ckmsgq_t *ckpapi;
@@ -194,14 +208,9 @@ struct ckpool_instance {
 	char *zmqblock;
 
 	/* Filesystem path to the bitcoind mining IPC unix socket. When set and
-	 * present, block notifications are driven from the IPC interface in
-	 * preference to ZMQ. */
+	 * present, block notifications and template generation are driven from
+	 * the IPC interface in preference to ZMQ / getblocktemplate. */
 	char *ipcmining;
-
-	/* When true, generate block templates from the mining IPC interface
-	 * (createNewBlock) in preference to getblocktemplate, falling back to
-	 * RPC when the IPC interface is unavailable. */
-	bool ipctemplate;
 
 	/* Threads of main process */
 	pthread_t pth_listener;
@@ -250,7 +259,7 @@ struct ckpool_instance {
 
 	/* Difficulty settings */
 	int64_t mindiff; // Default 1
-	int64_t startdiff; // Default 42
+	int64_t startdiff; // Default 10000
 	int64_t highdiff; // Default 1000000
 	int64_t maxdiff; // No default
 
@@ -280,6 +289,8 @@ struct ckpool_instance {
 	bool *nodeserver; // If this server URL serves node information
 	int nodeservers; // If this server has remote node servers
 	bool *trusted; // If this server URL accepts trusted remote nodes
+	bool *passthroughserver; // If this server URL accepts passthrough clients
+	int passthroughservers; // Number of passthrough accepting bindings
 	char *upstream; // Upstream pool in trusted remote mode
 
 	int update_interval; // Seconds between stratum updates
@@ -291,6 +302,10 @@ struct ckpool_instance {
 	char **proxyurl;
 	char **proxyauth;
 	char **proxypass;
+	/* Per-entry SV2 Job Declaration server URL, NULL when the entry does no
+	 * job declaration. Presence enables the JD client for that upstream and
+	 * requires an SV2 proxyurl plus a mining IPC socket. */
+	char **proxyjds;
 
 	/* Passthrough redirect options */
 	int redirecturls;
@@ -307,8 +322,29 @@ struct ckpool_instance {
 	void *btc_mining_ctx;
 
 	/* Opaque mining_ipc_service* for IPC block template generation. NULL
-	 * when ipctemplate is off or the interface is unavailable. */
+	 * when ipcmining is unset or the interface is unavailable. */
 	void *btc_template_svc;
+
+	/* Opaque mining_ipc_service* dedicated to Mining.checkBlock (SV2 JD
+	 * Phase 2). Separate EzRpcClient/service thread from btc_template_svc
+	 * so validation cannot HOL-block workgen/submit marshalling. */
+	void *btc_validation_svc;
+
+#ifdef HAVE_SV2
+	/* Stratum V2 mining listen URLs (like serverurl). sv2urls==0 = disabled. */
+	char **sv2url;
+	int sv2urls;
+	/* Stratum V2 Job Declaration listen URLs. sv2jdurls==0 = off. */
+	char **sv2jdurl;
+	int sv2jdurls;
+	/* Optional paths to Noise authority / server static key material. */
+	char *sv2_authority_key;
+	char *sv2_static_key;
+	/* Per-serverurl: true if this bind is SV2 (binary), not SV1 JSON. */
+	bool *server_sv2;
+	/* Per-serverurl: true if SV2 bind is Job Declaration (not Mining). */
+	bool *server_sv2_jd;
+#endif
 };
 
 enum stratum_msgtype {
@@ -371,8 +407,9 @@ void get_timestamp(char *stamp);
 
 ckmsgq_t *create_ckmsgq(const char *name, const void *func);
 ckmsgq_t *create_ckmsgqs(const char *name, const void *func, const int count);
-bool _ckmsgq_add(ckmsgq_t *ckmsgq, void *data, const char *file, const char *func, const int line);
-#define ckmsgq_add(ckmsgq, data) _ckmsgq_add(ckmsgq, data, __FILE__, __func__, __LINE__)
+bool _ckmsgq_add(ckmsgq_t *ckmsgq, void *data, bool head, const char *file, const char *func, const int line);
+#define ckmsgq_add(ckmsgq, data) _ckmsgq_add(ckmsgq, data, false, __FILE__, __func__, __LINE__)
+#define ckmsgq_add_head(ckmsgq, data) _ckmsgq_add(ckmsgq, data, true, __FILE__, __func__, __LINE__)
 bool ckmsgq_empty(ckmsgq_t *ckmsgq);
 unix_msg_t *get_unix_msg(proc_instance_t *pi);
 
