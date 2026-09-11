@@ -597,8 +597,10 @@ static int ser_bip34_height(uint8_t *buf, uint32_t height)
 
 static void generate_coinbase(workbase_t *wb)
 {
-	uint64_t u64, g64, d64 = 0;
+	uint64_t u64, g64, d64 = 0, mandatory_total = 0;
 	uint32_t u32;
+	uint8_t txout_count;
+	int i;
 	sdata_t *sdata = ckpool.sdata;
 	char header[272];
 	int header_len, script_len_pos;
@@ -689,16 +691,25 @@ static void generate_coinbase(workbase_t *wb)
 	memcpy(wb->coinb2bin + wb->coinb2len, "\xff\xff\xff\xfe", 4);
 	wb->coinb2len += 4;
 
-	// Generation value
+	/* Generation value after any consensus-mandatory GBT outputs. */
 	g64 = wb->coinbasevalue;
+	for (i = 0; i < wb->mandatory_outputs; i++) {
+		mandatory_total += wb->mandatory_output[i].amount;
+		if (unlikely(mandatory_total > wb->coinbasevalue)) {
+			LOGEMERG("Mandatory GBT outputs exceed coinbasevalue");
+			exit(1);
+		}
+	}
+	g64 -= mandatory_total;
+	txout_count = 1 + wb->mandatory_outputs + wb->insert_witness;
 	if (ckpool.donvalid && ckpool.donation > 0) {
 		double dbl64 = (double)g64 / 100 * ckpool.donation;
 
 		d64 = dbl64;
 		g64 -= d64; // To guarantee integers add up to the original coinbasevalue
-		wb->coinb2bin[wb->coinb2len++] = 2 + wb->insert_witness;
-	} else
-		wb->coinb2bin[wb->coinb2len++] = 1 + wb->insert_witness;
+		txout_count++;
+	}
+	wb->coinb2bin[wb->coinb2len++] = txout_count;
 
 	u64 = htole64(g64);
 	memcpy(&wb->coinb2bin[wb->coinb2len], &u64, sizeof(uint64_t));
@@ -707,7 +718,8 @@ static void generate_coinbase(workbase_t *wb)
 	/* Coinb2 address goes here, takes up 23~25 bytes + 1 byte for length */
 
 	wb->coinb3len = 0;
-	wb->coinb3bin = ckzalloc(256 + wb->insert_witness * (8 + witnessdata_size + 2));
+	wb->coinb3bin = ckzalloc(512 + wb->mandatory_outputs * (8 + 1 + MAX_GBT_OUTPUT_SCRIPT_LEN) +
+			       wb->insert_witness * (8 + witnessdata_size + 2));
 
 	if (ckpool.donvalid && ckpool.donation > 0) {
 		u64 = htole64(d64);
@@ -719,6 +731,28 @@ static void generate_coinbase(workbase_t *wb)
 		wb->coinb3len += sdata->dontxnlen;
 	} else
 		ckpool.donation = 0;
+
+	for (i = 0; i < wb->mandatory_outputs; i++) {
+		const struct gbt_coinbase_output *output = &wb->mandatory_output[i];
+
+		u64 = htole64(output->amount);
+		memcpy(wb->coinb3bin + wb->coinb3len, &u64, sizeof(uint64_t));
+		wb->coinb3len += sizeof(uint64_t);
+		/* Configured mandatory scripts are bounded below CompactSize's 0xfd
+		 * threshold by MAX_GBT_OUTPUT_SCRIPT_LEN only in storage; encode the
+		 * full CompactSize form here so the generic path is not chain-sized. */
+		if (output->script_len < 0xfd) {
+			wb->coinb3bin[wb->coinb3len++] = output->script_len;
+		} else {
+			uint16_t slen = htole16(output->script_len);
+
+			wb->coinb3bin[wb->coinb3len++] = 0xfd;
+			memcpy(wb->coinb3bin + wb->coinb3len, &slen, sizeof(slen));
+			wb->coinb3len += sizeof(slen);
+		}
+		memcpy(wb->coinb3bin + wb->coinb3len, output->script, output->script_len);
+		wb->coinb3len += output->script_len;
+	}
 
 	if (wb->insert_witness) {
 		// 0 value
@@ -1147,7 +1181,8 @@ static void add_base(sdata_t *sdata, workbase_t *wb, bool *new_block)
 	 * value. Share validation and block-solve checks always use
 	 * wb->network_diff / current_workbase->network_diff on the client's
 	 * bound sdata, so mixed-network proxies remain correct. */
-	wb->network_diff = diff_from_nbits(wb->headerbin + 72);
+	wb->network_diff = wb->effective_diff > 0 ? wb->effective_diff :
+		diff_from_nbits(wb->headerbin + 72);
 	if (wb->network_diff < 1)
 		wb->network_diff = 1;
 	stats->network_diff = wb->network_diff;

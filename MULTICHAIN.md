@@ -96,6 +96,34 @@ The remaining implementation work therefore belongs to four generic layers:
 3. **Coinbase/block capabilities**: optional transaction timestamp, optional block suffix, and configurable mandatory outputs sourced from GBT.
 4. **Mining semantics**: selectable target source, selectable post-submit chain-tip behavior, and strict per-client SV1 version-mask negotiation/reconstruction.
 
+## GBT-defined coinbase outputs and effective target
+
+`gbtoutputs` is an optional array of generic descriptors. Each entry supplies an RFC6901-style JSON pointer in `amount` and exactly one pointer in `address` or `script`. `optional:true` permits a descriptor to disappear from a template; otherwise missing configured data rejects that template. Address outputs use the configured payout codec, including `cashaddr_prefix` when present. Script outputs consume raw scriptPubKey hex from GBT. All configured amounts are subtracted from the miner/pool generation value and emitted as separate transaction outputs before any witness commitment.
+
+`gbttarget` is an optional JSON pointer to a compact 4-byte target string. When present it replaces the effective block-solve/network difficulty used by ckpool while leaving the actual header nBits untouched. If the pointed field is absent on a particular template, normal GBT difficulty is retained.
+
+The current eCash profile is therefore data only:
+
+```json
+{
+  "cashaddr_prefix": "ecash",
+  "gbtoutputs": [
+    {
+      "amount": "/coinbasetxn/minerfund/minimumvalue",
+      "address": "/coinbasetxn/minerfund/addresses/0"
+    },
+    {
+      "amount": "/coinbasetxn/stakingrewards/minimumvalue",
+      "script": "/coinbasetxn/stakingrewards/payoutscript/hex"
+    }
+  ],
+  "gbttarget": "/rtt/nexttarget",
+  "preciousblock": false
+}
+```
+
+This matches the ordinary GBT shape used by the Bitcoin ABC ckpool reference. Installations using another GBT shape, including simple-GBT script fields, can point the same generic descriptors at those fields without adding coin-specific C code.
+
 ## Peercoin serialization profile
 
 The previously qualified keyless Peercoin path is represented without a Peercoin code branch:

@@ -7,7 +7,7 @@ TESTS = sha256 bip310 cashaddr chaincaps
 sha256_SOURCES = sha256.c
 bip310_SOURCES = bip310.c
 cashaddr_SOURCES = cashaddr.c
-chaincaps_SOURCES = chaincaps_test.c $(top_srcdir)/src/multichain.c $(top_srcdir)/src/yyjson.c
+chaincaps_SOURCES = chaincaps_test.c $(top_srcdir)/src/multichain.c $(top_srcdir)/src/payout.c $(top_srcdir)/src/yyjson.c
 chaincaps_LDADD = $(top_srcdir)/src/libckpool.a
 
 if HAVE_SV2

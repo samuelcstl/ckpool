@@ -394,6 +394,12 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 
 	gbt->height = height;
 
+	if (unlikely(!multichain_apply_gbt(gbt, res_val))) {
+		LOGERR("Failed to apply configured GBT consensus capabilities");
+		yyjson_mut_doc_free(mut_doc);
+		goto out;
+	}
+
 	/* The flags are optional non-consensus data appended to the coinbase
 	 * scriptsig and are decoded into fixed size buffers, so discard any
 	 * that are not valid hex of a length that fits rather than deriving
