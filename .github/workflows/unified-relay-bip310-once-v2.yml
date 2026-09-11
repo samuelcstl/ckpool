@@ -1,0 +1,203 @@
+name: Unified relay BIP310 fix once v2
+
+on:
+  push:
+    branches:
+      - agent/unified-relay-bip310-v1
+    paths:
+      - .github/workflows/unified-relay-bip310-once-v2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/unified-relay-bip310-v1
+          fetch-depth: 0
+
+      - name: Patch trusted-node relay version reconstruction
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/stratifier.c')
+          s = p.read_text()
+
+          def once(old, new, label):
+              global s
+              n = s.count(old)
+              if n != 1:
+                  raise SystemExit(f'{label}: expected 1 match, got {n}')
+              s = s.replace(old, new, 1)
+
+          once(
+          '''/* Needs to be entered with workbase readcount and client holding a ref count.
+           * If full_version is true, version_field replaces the header nVersion entirely
+           * (SV2 SubmitShares). Otherwise version_field is a BIP320 mask OR'd in (SV1). */''',
+          '''/* Needs to be entered with workbase readcount and client holding a ref count.
+           * If full_version is true, version_field replaces the header nVersion entirely
+           * (SV2 SubmitShares). Otherwise version_field is BIP310 version_bits and is
+           * applied with the per-client negotiated mask. */''',
+          'submission comment')
+
+          once(
+          '''static double
+          share_diff(char *coinbase, const uchar *enonce1bin, const workbase_t *wb, const char *nonce2,
+          \t   const uint32_t ntime32, uint32_t version_mask, const char *nonce,
+          \t   uchar *hash, uchar *swap, int *cblen)''',
+          '''static double
+          share_diff(char *coinbase, const uchar *enonce1bin, const workbase_t *wb, const char *nonce2,
+          \t   const uint32_t ntime32, const uint32_t version_bits, const uint32_t version_mask,
+          \t   const char *nonce, uchar *hash, uchar *swap, int *cblen)''',
+          'share_diff signature')
+
+          once(
+          '''\t/* Update nVersion when version_mask is in use */
+          \tif (version_mask) {
+          \t\tversion_mask = htobe32(version_mask);
+          \t\tdata32 = (uint32_t *)data;
+          \t\t*data32 |= version_mask;
+          \t}''',
+          '''\t/* Reconstruct BIP310 nVersion with replacement semantics. A submitted zero
+          \t * bit inside the effective mask must clear the corresponding template bit. */
+          \tif (version_mask) {
+          \t\tuint32_t version = bip310_apply_version(wb->version, version_mask, version_bits);
+
+          \t\tdata32 = (uint32_t *)data;
+          \t\t*data32 = htobe32(version);
+          \t}''',
+          'legacy OR reconstruction')
+
+          once(
+          '''static void send_node_block(sdata_t *sdata, const char *enonce1, const char *nonce,
+          \t\t\t    const char *nonce2, const uint32_t ntime32, const uint32_t version_mask,
+          \t\t\t    const int64_t jobid, const double diff, const int64_t client_id,
+          \t\t\t    const char *coinbase, const int cblen, const uchar *data)''',
+          '''static void send_node_block(sdata_t *sdata, const char *enonce1, const char *nonce,
+          \t\t\t    const char *nonce2, const uint32_t ntime32, const uint32_t version_bits,
+          \t\t\t    const uint32_t version_mask, const int64_t jobid, const double diff,
+          \t\t\t    const int64_t client_id, const char *coinbase, const int cblen,
+          \t\t\t    const uchar *data)''',
+          'send_node_block signature')
+
+          once(
+          '''\t\tyyjson_mut_obj_add_uint(doc, val, "ntime32", ntime32);
+          \t\tyyjson_mut_obj_add_uint(doc, val, "version_mask", version_mask);
+          \t\tyyjson_mut_obj_add_int(doc, val, "jobid", jobid);''',
+          '''\t\tyyjson_mut_obj_add_uint(doc, val, "ntime32", ntime32);
+          \t\t/* Keep version_mask as the legacy version-bits field for compatibility
+          \t\t * with older trusted nodes, while carrying the exact negotiated mask
+          \t\t * separately for strict replacement reconstruction. */
+          \t\tyyjson_mut_obj_add_uint(doc, val, "version_mask", version_bits);
+          \t\tyyjson_mut_obj_add_uint(doc, val, "version_bits", version_bits);
+          \t\tyyjson_mut_obj_add_uint(doc, val, "version_effective_mask", version_mask);
+          \t\tyyjson_mut_obj_add_int(doc, val, "jobid", jobid);''',
+          'node transport fields')
+
+          once(
+          '''\t\tconst char *nonce2, const char *nonce, const uint32_t ntime32, const uint32_t version_mask,
+          \t\tconst bool stale)''',
+          '''\t\tconst char *nonce2, const char *nonce, const uint32_t ntime32,
+          \t\tconst uint32_t version_bits, const uint32_t version_mask, const bool stale)''',
+          'test_blocksolve signature')
+
+          once(
+          '''\tsend_node_block(sdata, client->enonce1, nonce, nonce2, ntime32, version_mask,
+          \t\t\twb->id, diff, client->id, coinbase, cblen, data);''',
+          '''\tsend_node_block(sdata, client->enonce1, nonce, nonce2, ntime32, version_bits,
+          \t\t\tversion_mask, wb->id, diff, client->id, coinbase, cblen, data);''',
+          'send_node_block call')
+
+          once(
+          '''\ttest_blocksolve(client, wb, swap, hash, ret, coinbase, cblen, nonce2, nonce, ntime32,
+          \t\t\tfull_version ? 0 : version_field, stale);''',
+          '''\ttest_blocksolve(client, wb, swap, hash, ret, coinbase, cblen, nonce2, nonce, ntime32,
+          \t\t\tfull_version ? 0 : version_field,
+          \t\t\t(!full_version && client->version_rolling) ? client->version_mask : 0, stale);''',
+          'test_blocksolve call')
+
+          once(
+          '''\tuint32_t ntime32, version_mask = 0;''',
+          '''\tuint32_t ntime32, version_bits = 0, version_mask = 0;''',
+          'submit_node variables')
+
+          once(
+          '''\tif (!yyjson_mut_obj_get_uint32(&version_mask, val, "version_mask")) {
+          \t\t/* No version mask is not fatal, assume it to be zero */
+          \t\tLOGINFO("No version mask in node method block");
+          \t}
+
+          \tLOGWARNING("Possible upstream block solve diff %lf !", diff);''',
+          '''\tif (!yyjson_mut_obj_get_uint32(&version_bits, val, "version_bits") &&
+          \t    !yyjson_mut_obj_get_uint32(&version_bits, val, "version_mask")) {
+          \t\t/* No version bits is not fatal, assume an unrolled template version. */
+          \t\tLOGINFO("No version bits in node method block");
+          \t}
+          \tif (!yyjson_mut_obj_get_uint32(&version_mask, val, "version_effective_mask")) {
+          \t\t/* Legacy trusted nodes only transported submitted bits. The exact
+          \t\t * negotiated mask cannot be recovered, so use the configured pool
+          \t\t * mask as the strictest reconstruction policy available. */
+          \t\tversion_mask = version_bits ? ckpool.version_mask : 0;
+          \t}
+          \tif (unlikely(!bip310_version_bits_valid(version_bits, version_mask))) {
+          \t\tLOGWARNING("Invalid version bits %08x outside effective mask %08x in node block",
+          \t\t\t   version_bits, version_mask);
+          \t\tgoto out;
+          \t}
+
+          \tLOGWARNING("Possible upstream block solve diff %lf !", diff);''',
+          'submit_node version parsing')
+
+          once(
+          '''\t\tshare_diff(coinbase, enonce1bin, wb, nonce2, ntime32, version_mask, nonce, hash, swap, &cblen);''',
+          '''\t\tshare_diff(coinbase, enonce1bin, wb, nonce2, ntime32, version_bits, version_mask,
+          \t\t\t   nonce, hash, swap, &cblen);''',
+          'share_diff call')
+
+          p.write_text(s)
+          PY
+
+          grep -n -A9 -B5 'Reconstruct BIP310 nVersion' src/stratifier.c
+          grep -n -A12 -B4 'version_effective_mask' src/stratifier.c | head -80
+
+      - name: Build and test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf automake libtool pkg-config libcap-dev libcurl4-openssl-dev libssl-dev yasm
+          git submodule update --init --recursive
+          ./autogen.sh
+          ./configure
+          make -j"$(nproc)"
+          make -C test check
+
+      - name: Static regression gate
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          grep -F 'bip310_apply_version(wb->version, version_mask, version_bits)' src/stratifier.c
+          grep -F '"version_effective_mask", version_mask' src/stratifier.c
+          grep -F 'client->version_mask : 0, stale' src/stratifier.c
+          if grep -F '*data32 |= version_mask;' src/stratifier.c; then
+            echo 'legacy OR reconstruction remains'
+            exit 1
+          fi
+
+      - name: Commit validated source fix and remove one-shot workflows
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'Samuel Castel'
+          git config user.email '2681949+samuelcstl@users.noreply.github.com'
+          git rm .github/workflows/unified-relay-bip310-once.yml
+          git rm .github/workflows/unified-relay-bip310-once-v2.yml
+          git add src/stratifier.c
+          git commit -m 'bip310: preserve negotiated mask across trusted relay'
+          git push origin HEAD:agent/unified-relay-bip310-v1
