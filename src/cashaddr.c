@@ -201,6 +201,21 @@ int cashaddr_to_script(const char *addr, const char *expected_prefix,
 	return hash160_to_script(script, hash160, p2sh);
 }
 
+int cashaddr_or_standard_to_script(uint8_t *script, const char *addr,
+                                   const char *expected_prefix,
+                                   bool standard_script, bool segwit)
+{
+	int len = 0;
+
+	if (!script || !addr)
+		return 0;
+	if (expected_prefix && *expected_prefix)
+		len = cashaddr_to_script(addr, expected_prefix, script, NULL);
+	if (len)
+		return len;
+	return address_to_txn((char *)script, addr, standard_script, segwit);
+}
+
 bool cashaddr_normalize(char *dst, size_t dst_len, const char *addr,
                         const char *expected_prefix)
 {

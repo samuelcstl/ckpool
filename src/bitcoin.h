@@ -19,6 +19,8 @@ typedef struct genwork gbtbase_t;
 #define MAX_GBT_FLAGS_LEN 32
 
 bool validate_address(connsock_t *cs, const char *address, bool *script, bool *segwit);
+int payout_address_to_txn(char *p2h, const char *addr, const bool script,
+                          const bool segwit);
 yyjson_doc *validate_txn(connsock_t *cs, const char *txn);
 bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt);
 void clear_gbtbase(gbtbase_t *gbt);
@@ -29,5 +31,15 @@ bool submit_block(connsock_t *cs, const char *params);
 void precious_block(connsock_t *cs, const char *params);
 void submit_txn(connsock_t *cs, const char *params);
 char *get_txn(connsock_t *cs, const char *hash);
+
+/*
+ * Payout construction in ckpool translation units goes through the generic
+ * chain-aware adapter. libckpool.c does not include this header, so the
+ * underlying upstream address_to_txn() implementation remains unchanged.
+ * payout.c defines CKPOOL_PAYOUT_IMPLEMENTATION to call that raw primitive.
+ */
+#ifndef CKPOOL_PAYOUT_IMPLEMENTATION
+#define address_to_txn payout_address_to_txn
+#endif
 
 #endif /* BITCOIN_H */

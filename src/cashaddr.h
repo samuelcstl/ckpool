@@ -21,6 +21,14 @@ int cashaddr_to_script(const char *addr, const char *expected_prefix,
                        uint8_t *script, bool *is_p2sh);
 
 /*
+ * Prefer CashAddr decoding when expected_prefix is configured, otherwise
+ * preserve ckpool's existing Base58/SegWit script construction verbatim.
+ */
+int cashaddr_or_standard_to_script(uint8_t *script, const char *addr,
+                                   const char *expected_prefix,
+                                   bool standard_script, bool segwit);
+
+/*
  * Canonicalise a valid address to lowercase "prefix:payload" form.
  * Returns false if the address is invalid or the destination is too small.
  */
