@@ -267,7 +267,7 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 {
 	yyjson_doc *doc = NULL;
 	yyjson_mut_doc *mut_doc;
-	yyjson_val *rules_array, *coinbase_aux, *res_val, *root;
+	yyjson_val *rules_array, *coinbase_aux, *res_val, *root, *version_val;
 	yyjson_mut_val *mut_root;
 	const char *previousblockhash;
 	char hash_swap[32], tmp[32];
@@ -319,7 +319,8 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 
 	previousblockhash = yyjson_get_str(yyjson_obj_get(res_val, "previousblockhash"));
 	target = yyjson_get_str(yyjson_obj_get(res_val, "target"));
-	version = yyjson_get_num(yyjson_obj_get(res_val, "version"));
+	version_val = yyjson_obj_get(res_val, "version");
+	version = yyjson_get_num(version_val);
 	curtime = yyjson_get_num(yyjson_obj_get(res_val, "curtime"));
 	bits = yyjson_get_str(yyjson_obj_get(res_val, "bits"));
 	height = yyjson_get_num(yyjson_obj_get(res_val, "height"));
@@ -329,7 +330,8 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	if (!flags)
 		flags = "";
 
-	if (unlikely(!previousblockhash || !target || !version || !curtime || !bits || !coinbase_aux)) {
+	if (unlikely(!previousblockhash || !target || !version_val || !yyjson_is_num(version_val) ||
+	             !curtime || !bits || !coinbase_aux)) {
 		LOGERR("JSON failed to decode GBT %s %s %d %d %s %s", previousblockhash, target, version, curtime, bits, flags);
 		goto out;
 	}
