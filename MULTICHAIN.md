@@ -70,7 +70,7 @@ The deployed BCH fork requests a template without the SegWit `rules` member and 
 }
 ```
 
-CashAddr P2PKH/P2SH script construction is local and prefix-driven. Legacy Base58 and SegWit script construction remains on the upstream path when CashAddr does not match. Daemon `validateaddress` remains authoritative for configured and username-derived payout acceptance; the final live BCH qualification therefore checks those entry paths as well as script construction.
+CashAddr P2PKH/P2SH admission and script construction are local and prefix-driven, including valid prefixless CashAddr payloads. When an address does not match the configured CashAddr prefix, validation and Base58/SegWit construction fall back to the upstream daemon path. This keeps default Bitcoin behavior unchanged while removing a daemon-format dependency from BCH/XEC configured and username-derived payouts.
 
 `gbtparams` and `gbtargs` preserve JSON value types, so future chains may provide booleans, numbers, strings, arrays, objects, or null values without adding chain-specific code. `gbtdrop` entries must be strings.
 

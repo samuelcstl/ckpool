@@ -6270,6 +6270,15 @@ static worker_instance_t *get_worker(sdata_t *sdata, user_instance_t *user, cons
 	return get_create_worker(sdata, user, workername, &dummy);
 }
 
+/* Prefer the configured local payout codec when it can prove an address is
+ * valid. Everything else stays on the upstream daemon-validation path. */
+static bool payout_address_valid(const char *address, bool *script, bool *segwit)
+{
+	if (payout_address_is_cashaddr(address, script, segwit))
+		return true;
+	return generator_checkaddr(address, script, segwit);
+}
+
 /* This simply strips off the first part of the workername and matches it to a
  * user or creates a new one. Needs to be entered with client holding a ref
  * count. */
@@ -6307,7 +6316,7 @@ static user_instance_t *generate_user(stratum_instance_t *client,
 
 	if (!ckpool.proxy && (new_user || !user->btcaddress)) {
 		/* Is this a btc address based username? */
-		if (generator_checkaddr(username, &user->script, &user->segwit)) {
+		if (payout_address_valid(username, &user->script, &user->segwit)) {
 			user->btcaddress = true;
 			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
 		}
@@ -8720,7 +8729,7 @@ static user_instance_t *generate_remote_user(const char *workername)
 
 	if (!ckpool.proxy && (new_user || !user->btcaddress)) {
 		/* Is this a btc address based username? */
-		if (generator_checkaddr(username, &user->script, &user->segwit)) {
+		if (payout_address_valid(username, &user->script, &user->segwit)) {
 			user->btcaddress = true;
 			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
 		}
@@ -10757,8 +10766,8 @@ void *stratifier(void *arg)
 		cksleep_ms(10);
 
 	if (!ckpool.proxy) {
-		if (!generator_checkaddr(ckpool.btcaddress, &ckpool.script, &ckpool.segwit)) {
-			LOGEMERG("Fatal: btcaddress invalid according to bitcoind");
+		if (!payout_address_valid(ckpool.btcaddress, &ckpool.script, &ckpool.segwit)) {
+			LOGEMERG("Fatal: payout address invalid according to configured codec/node");
 			goto out;
 		}
 
@@ -10767,16 +10776,16 @@ void *stratifier(void *arg)
 		sdata->txnlen = address_to_txn(sdata->txnbin, ckpool.btcaddress, ckpool.script, ckpool.segwit);
 
 		/* Find a valid donation address if possible */
-		if (generator_checkaddr(ckpool.donaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+		if (payout_address_valid(ckpool.donaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donvalid = true;
 			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
 			LOGNOTICE("BTC donation address valid %s", ckpool.donaddress);
-		} else if (generator_checkaddr(ckpool.tndonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+		} else if (payout_address_valid(ckpool.tndonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donaddress = ckpool.tndonaddress;
 			ckpool.donvalid = true;
 			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
 			LOGNOTICE("BTC testnet donation address valid %s", ckpool.donaddress);
-		} else if (generator_checkaddr(ckpool.rtdonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+		} else if (payout_address_valid(ckpool.rtdonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donaddress = ckpool.rtdonaddress;
 			ckpool.donvalid = true;
 			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);

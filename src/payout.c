@@ -78,6 +78,23 @@ out:
 	yyjson_doc_free(doc);
 }
 
+bool payout_address_is_cashaddr(const char *addr, bool *script, bool *segwit)
+{
+	uint8_t hash160[20];
+	bool is_p2sh;
+
+	pthread_once(&cashaddr_prefix_once, load_cashaddr_prefix);
+	if (!cashaddr_prefix_configured || unlikely(!cashaddr_prefix_valid))
+		return false;
+	if (!cashaddr_decode(addr, cashaddr_prefix, hash160, &is_p2sh))
+		return false;
+	if (script)
+		*script = is_p2sh;
+	if (segwit)
+		*segwit = false;
+	return true;
+}
+
 int payout_address_to_txn(char *p2h, const char *addr, const bool script,
                           const bool segwit)
 {

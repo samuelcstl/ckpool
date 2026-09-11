@@ -82,7 +82,10 @@ static int profile_ppc(void)
 static int profile_bch(void)
 {
     static const char *addr = "bitcoincash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a";
+    static const char *prefixless = "qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a";
+    static const char *p2sh = "bitcoincash:ppm2qsznhks23z7629mms6s4cwef74vcwvn0h829pq";
     char script[64];
+    bool is_script = false, segwit = true;
     char *path = write_config("{\"cashaddr_prefix\":\"bitcoincash\",\"gbtdrop\":[\"rules\"]}\n");
     int len, rc = 0;
 
@@ -92,12 +95,21 @@ static int profile_bch(void)
     ckpool.config = path;
     if (!multichain_config_valid())
         rc = 2;
-    else if ((len = payout_address_to_txn(script, addr, false, false)) != 25)
+    else if (!payout_address_is_cashaddr(addr, &is_script, &segwit) || is_script || segwit)
         rc = 3;
+    else if (!payout_address_is_cashaddr(prefixless, &is_script, &segwit) || is_script || segwit)
+        rc = 4;
+    else if (!payout_address_is_cashaddr(p2sh, &is_script, &segwit) || !is_script || segwit)
+        rc = 5;
+    else if (payout_address_is_cashaddr("ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2",
+                                        &is_script, &segwit))
+        rc = 6;
+    else if ((len = payout_address_to_txn(script, addr, false, false)) != 25)
+        rc = 7;
     else if ((unsigned char)script[0] != 0x76 || (unsigned char)script[1] != 0xa9 ||
              (unsigned char)script[2] != 0x14 || (unsigned char)script[23] != 0x88 ||
              (unsigned char)script[24] != 0xac)
-        rc = 4;
+        rc = 8;
     cleanup_config(path);
     return rc;
 }
@@ -132,6 +144,13 @@ static int profile_xec(void)
         multichain_preciousblock() || multichain_block_suffix()) {
         rc = 3;
         goto out;
+    }
+    {
+        bool is_script = true, segwit = true;
+        if (!payout_address_is_cashaddr(addr, &is_script, &segwit) || is_script || segwit) {
+            rc = 8;
+            goto out;
+        }
     }
     snprintf(gbtjson, sizeof(gbtjson),
         "{\"coinbasetxn\":{\"minerfund\":{\"minimumvalue\":3200,"
