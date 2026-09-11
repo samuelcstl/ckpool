@@ -1,0 +1,100 @@
+name: agent-unified-multichain-complete
+
+on:
+  push:
+    branches:
+      - agent/unified-multichain-complete-v1
+
+permissions:
+  contents: write
+
+jobs:
+  complete:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout patch driver
+        uses: actions/checkout@v4
+        with:
+          ref: agent/unified-multichain-complete-v1
+          path: patcher
+          fetch-depth: 1
+
+      - name: Checkout clean target branch
+        uses: actions/checkout@v4
+        with:
+          ref: unified-multichain-v1
+          path: src
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Verify target revision
+        working-directory: src
+        run: |
+          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "ee5383e3620a725c6c74f57f823e9dbfbc38d2b2"
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential autoconf automake libtool pkg-config yasm \
+            libzmq3-dev libsodium-dev libssl-dev
+
+      - name: Configure git author
+        working-directory: src
+        run: |
+          git config user.name "Samuel Castel"
+          git config user.email "2681949+samuelcstl@users.noreply.github.com"
+
+      - name: Phase 1 - generic capability framework
+        working-directory: src
+        run: |
+          set -Eeuo pipefail
+          python3 ../patcher/tools/agent_multichain_complete.py phase1
+          ./autogen.sh
+          ./configure
+          make -j2
+          make check
+          git add src/Makefile.am src/bitcoin.c src/multichain.c src/multichain.h \
+                  test/Makefile.am test/chaincaps_test.c
+          git diff --cached --check
+          git commit -m "multichain: add generic consensus capability config"
+          git push origin HEAD:unified-multichain-v1
+
+      - name: Phase 2 - qualified PPC serialization wiring
+        working-directory: src
+        run: |
+          set -Eeuo pipefail
+          python3 ../patcher/tools/agent_multichain_complete.py phase2
+          ./autogen.sh
+          ./configure
+          make -j2
+          make check
+          git add src/stratifier.c MULTICHAIN.md
+          git diff --cached --check
+          git commit -m "ppc: wire generic serialization capabilities"
+          git push origin HEAD:unified-multichain-v1
+
+      - name: Phase 3 - GBT outputs and effective target
+        working-directory: src
+        run: |
+          set -Eeuo pipefail
+          python3 ../patcher/tools/agent_multichain_complete.py phase3
+          ./autogen.sh
+          ./configure
+          make -j2
+          make check
+          git add src/multichain.c src/multichain.h src/stratifier.h src/bitcoin.c \
+                  src/stratifier.c test/Makefile.am test/chaincaps_test.c MULTICHAIN.md
+          git diff --cached --check
+          git commit -m "multichain: add GBT-defined outputs and effective target"
+          git push origin HEAD:unified-multichain-v1
+
+      - name: Final branch summary
+        working-directory: src
+        run: |
+          set -Eeuo pipefail
+          git status --short --branch
+          git log -4 --oneline
+          make check
