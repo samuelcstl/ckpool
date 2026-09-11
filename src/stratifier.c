@@ -2215,8 +2215,8 @@ static void add_node_base(yyjson_mut_val *val, bool trusted, int64_t client_id)
 /* Calculate share diff and fill in hash and swap. Need to hold workbase read count */
 static double
 share_diff(char *coinbase, const uchar *enonce1bin, const workbase_t *wb, const char *nonce2,
-	   const uint32_t ntime32, uint32_t version_mask, const char *nonce,
-	   uchar *hash, uchar *swap, int *cblen)
+	   const uint32_t ntime32, const uint32_t version_bits, const uint32_t version_mask,
+	   const char *nonce, uchar *hash, uchar *swap, int *cblen)
 {
 	unsigned char merkle_root[32], merkle_sha[64];
 	uint32_t *data32, *swap32, benonce32;
@@ -2248,11 +2248,13 @@ share_diff(char *coinbase, const uchar *enonce1bin, const workbase_t *wb, const 
 	memcpy(data, wb->headerbin, 80);
 	memcpy(data + 36, merkle_root, 32);
 
-	/* Update nVersion when version_mask is in use */
+	/* Reconstruct BIP310 nVersion with replacement semantics. A submitted zero
+	 * bit inside the effective mask must clear the corresponding template bit. */
 	if (version_mask) {
-		version_mask = htobe32(version_mask);
+		uint32_t version = bip310_apply_version(wb->version, version_mask, version_bits);
+
 		data32 = (uint32_t *)data;
-		*data32 |= version_mask;
+		*data32 = htobe32(version);
 	}
 
 	/* Insert the nonce value into the data */
@@ -2335,9 +2337,10 @@ static void send_nodes_block(sdata_t *sdata, yyjson_mut_doc *block_doc, const in
 
 /* Entered with workbase readcount. */
 static void send_node_block(sdata_t *sdata, const char *enonce1, const char *nonce,
-			    const char *nonce2, const uint32_t ntime32, const uint32_t version_mask,
-			    const int64_t jobid, const double diff, const int64_t client_id,
-			    const char *coinbase, const int cblen, const uchar *data)
+			    const char *nonce2, const uint32_t ntime32, const uint32_t version_bits,
+			    const uint32_t version_mask, const int64_t jobid, const double diff,
+			    const int64_t client_id, const char *coinbase, const int cblen,
+			    const uchar *data)
 {
 	if (sdata->node_instances) {
 		yyjson_mut_doc *doc = yyjson_mut_doc_new(&ckyyalc);
@@ -2348,7 +2351,12 @@ static void send_node_block(sdata_t *sdata, const char *enonce1, const char *non
 		yyjson_mut_obj_add_strcpy(doc, val, "nonce", nonce);
 		yyjson_mut_obj_add_strcpy(doc, val, "nonce2", nonce2);
 		yyjson_mut_obj_add_uint(doc, val, "ntime32", ntime32);
-		yyjson_mut_obj_add_uint(doc, val, "version_mask", version_mask);
+		/* Keep version_mask as the legacy version-bits field for compatibility
+		 * with older trusted nodes, while carrying the exact negotiated mask
+		 * separately for strict replacement reconstruction. */
+		yyjson_mut_obj_add_uint(doc, val, "version_mask", version_bits);
+		yyjson_mut_obj_add_uint(doc, val, "version_bits", version_bits);
+		yyjson_mut_obj_add_uint(doc, val, "version_effective_mask", version_mask);
 		yyjson_mut_obj_add_int(doc, val, "jobid", jobid);
 		yyjson_mut_obj_add_real(doc, val, "diff", diff);
 		add_remote_blockdata(doc, val, cblen, coinbase, data);
@@ -2490,7 +2498,7 @@ static void submit_node_block(sdata_t *sdata, yyjson_mut_val *val)
 	char *coinbase = NULL, *enonce1 = NULL, *nonce = NULL, *nonce2 = NULL, *gbt_block,
 		*coinbasehex, *swaphex;
 	uchar *enonce1bin = NULL, hash[32], swap[80], flip32[32];
-	uint32_t ntime32, version_mask = 0;
+	uint32_t ntime32, version_bits = 0, version_mask = 0;
 	char blockhash[68], cdfield[64];
 	int enonce1len, cblen = 0;
 	workbase_t *wb = NULL;
@@ -2525,9 +2533,21 @@ static void submit_node_block(sdata_t *sdata, yyjson_mut_val *val)
 		goto out;
 	}
 
-	if (!yyjson_mut_obj_get_uint32(&version_mask, val, "version_mask")) {
-		/* No version mask is not fatal, assume it to be zero */
-		LOGINFO("No version mask in node method block");
+	if (!yyjson_mut_obj_get_uint32(&version_bits, val, "version_bits") &&
+	    !yyjson_mut_obj_get_uint32(&version_bits, val, "version_mask")) {
+		/* No version bits is not fatal, assume an unrolled template version. */
+		LOGINFO("No version bits in node method block");
+	}
+	if (!yyjson_mut_obj_get_uint32(&version_mask, val, "version_effective_mask")) {
+		/* Legacy trusted nodes only transported submitted bits. The exact
+		 * negotiated mask cannot be recovered, so use the configured pool
+		 * mask as the strictest reconstruction policy available. */
+		version_mask = version_bits ? ckpool.version_mask : 0;
+	}
+	if (unlikely(!bip310_version_bits_valid(version_bits, version_mask))) {
+		LOGWARNING("Invalid version bits %08x outside effective mask %08x in node block",
+			   version_bits, version_mask);
+		goto out;
 	}
 
 	LOGWARNING("Possible upstream block solve diff %lf !", diff);
@@ -2573,7 +2593,8 @@ static void submit_node_block(sdata_t *sdata, yyjson_mut_val *val)
 		}
 		coinbase = alloca(wb->coinb1len + wb->enonce1constlen + wb->enonce1varlen + wb->enonce2varlen + wb->coinb2len);
 		/* Fill in the hashes */
-		share_diff(coinbase, enonce1bin, wb, nonce2, ntime32, version_mask, nonce, hash, swap, &cblen);
+		share_diff(coinbase, enonce1bin, wb, nonce2, ntime32, version_bits, version_mask,
+			   nonce, hash, swap, &cblen);
 	}
 
 	/* Now we have enough to assemble a block */
@@ -6680,8 +6701,8 @@ static bool ipc_submit_block(const workbase_t *wb, const uchar *data, const char
 static void
 test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uchar *data,
 		const uchar *hash, const double diff, const char *coinbase, int cblen,
-		const char *nonce2, const char *nonce, const uint32_t ntime32, const uint32_t version_mask,
-		const bool stale)
+		const char *nonce2, const char *nonce, const uint32_t ntime32,
+		const uint32_t version_bits, const uint32_t version_mask, const bool stale)
 {
 	char blockhash[68], cdfield[64], *gbt_block;
 	sdata_t *sdata = client->sdata;
@@ -6726,8 +6747,8 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	} else
 #endif
 		gbt_block = process_block(wb, coinbase, cblen, data, hash, flip32, blockhash);
-	send_node_block(sdata, client->enonce1, nonce, nonce2, ntime32, version_mask,
-			wb->id, diff, client->id, coinbase, cblen, data);
+	send_node_block(sdata, client->enonce1, nonce, nonce2, ntime32, version_bits,
+			version_mask, wb->id, diff, client->id, coinbase, cblen, data);
 
 	doc = yyjson_mut_doc_new(&ckyyalc);
 	val = yyjson_mut_obj(doc);
@@ -6803,7 +6824,8 @@ out_nouserwb:
 
 /* Needs to be entered with workbase readcount and client holding a ref count.
  * If full_version is true, version_field replaces the header nVersion entirely
- * (SV2 SubmitShares). Otherwise version_field is a BIP320 mask OR'd in (SV1). */
+ * (SV2 SubmitShares). Otherwise version_field is BIP310 version_bits and is
+ * applied with the per-client negotiated mask. */
 static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, const workbase_t *wb,
 			      const char *nonce2, const uint32_t ntime32, uint32_t version_field,
 			      const bool full_version, const char *nonce, uchar *hash,
@@ -6886,7 +6908,8 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 
 	/* Test we haven't solved a block regardless of share status */
 	test_blocksolve(client, wb, swap, hash, ret, coinbase, cblen, nonce2, nonce, ntime32,
-			full_version ? 0 : version_field, stale);
+			full_version ? 0 : version_field,
+			(!full_version && client->version_rolling) ? client->version_mask : 0, stale);
 
 	return ret;
 }
