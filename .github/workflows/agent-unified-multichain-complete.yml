@@ -47,7 +47,7 @@ jobs:
           git config user.name "Samuel Castel"
           git config user.email "2681949+samuelcstl@users.noreply.github.com"
 
-      - name: Point patch driver at clean target checkout
+      - name: Prepare patch driver for clean target checkout
         working-directory: src
         run: |
           set -Eeuo pipefail
@@ -56,10 +56,22 @@ jobs:
           p = Path('../patcher/tools/agent_multichain_complete.py')
           s = p.read_text()
           old = 'ROOT = Path(__file__).resolve().parents[1]'
-          new = 'ROOT = Path.cwd()'
           if s.count(old) != 1:
               raise SystemExit(f'expected exactly one patch-root marker, got {s.count(old)}')
-          p.write_text(s.replace(old, new, 1))
+          s = s.replace(old, 'ROOT = Path.cwd()', 1)
+
+          old_link = 'chaincaps_SOURCES = chaincaps_test.c $(top_srcdir)/src/multichain.c\\nchaincaps_LDADD'
+          new_link = 'chaincaps_SOURCES = chaincaps_test.c $(top_srcdir)/src/multichain.c $(top_srcdir)/src/yyjson.c\\nchaincaps_LDADD'
+          if s.count(old_link) != 2:
+              raise SystemExit(f'expected two chaincaps link markers, got {s.count(old_link)}')
+          s = s.replace(old_link, new_link)
+
+          old_phase3 = 'chaincaps_SOURCES = chaincaps_test.c $(top_srcdir)/src/multichain.c $(top_srcdir)/src/payout.c\\nchaincaps_LDADD'
+          new_phase3 = 'chaincaps_SOURCES = chaincaps_test.c $(top_srcdir)/src/multichain.c $(top_srcdir)/src/payout.c $(top_srcdir)/src/yyjson.c\\nchaincaps_LDADD'
+          if s.count(old_phase3) != 1:
+              raise SystemExit(f'expected one phase3 link marker, got {s.count(old_phase3)}')
+          s = s.replace(old_phase3, new_phase3, 1)
+          p.write_text(s)
           PY
 
       - name: Phase 1 - generic capability framework
