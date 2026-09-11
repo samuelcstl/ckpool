@@ -59,15 +59,18 @@ The LCC node requires a fixed `powalgo` field for SHA256d template selection:
 }
 ```
 
-### Bitcoin Cash GBT
+### Bitcoin Cash GBT and payout codec
 
-The deployed BCH fork requests a template without the SegWit `rules` member. The generic equivalent is:
+The deployed BCH fork requests a template without the SegWit `rules` member and uses CashAddr payouts. The generic profile is:
 
 ```json
 {
-  "gbtdrop": ["rules"]
+  "gbtdrop": ["rules"],
+  "cashaddr_prefix": "bitcoincash"
 }
 ```
+
+CashAddr P2PKH/P2SH script construction is local and prefix-driven. Legacy Base58 and SegWit script construction remains on the upstream path when CashAddr does not match. Daemon `validateaddress` remains authoritative for configured and username-derived payout acceptance; the final live BCH qualification therefore checks those entry paths as well as script construction.
 
 `gbtparams` and `gbtargs` preserve JSON value types, so future chains may provide booleans, numbers, strings, arrays, objects, or null values without adding chain-specific code. `gbtdrop` entries must be strings.
 
@@ -89,12 +92,12 @@ The fork is not considered fleet-ready until every consensus- or payout-relevant
 | suppress post-submit `preciousblock` | no | no | no | no | required for Avalanche compatibility |
 | strict negotiated SV1 version mask | hardening target | important (`0000e000`) | important | useful | useful |
 
-The remaining implementation work therefore belongs to four generic layers:
+The implementation is now decomposed into four generic layers:
 
-1. **GBT request shaping**: already implemented through `gbtparams`, `gbtdrop`, and `gbtargs`.
-2. **Address/script codecs**: add configurable CashAddr support shared by BCH and XEC while preserving normal Base58/SegWit behavior by default.
-3. **Coinbase/block capabilities**: optional transaction timestamp, optional block suffix, and configurable mandatory outputs sourced from GBT.
-4. **Mining semantics**: selectable target source, selectable post-submit chain-tip behavior, and strict per-client SV1 version-mask negotiation/reconstruction.
+1. **GBT request shaping** through `gbtparams`, `gbtdrop`, and `gbtargs`.
+2. **Address/script codecs** through configurable CashAddr support shared by BCH and XEC while preserving normal Base58/SegWit behavior by default.
+3. **Coinbase/block capabilities** through optional transaction timestamp, optional block suffix, and configurable mandatory outputs sourced from GBT.
+4. **Mining semantics** through selectable target source, selectable post-submit chain-tip behavior, and strict per-client SV1 version-mask negotiation/reconstruction.
 
 ## GBT-defined coinbase outputs and effective target
 
@@ -147,3 +150,21 @@ These settings contain protocol configuration only. Runtime credentials, payout 
 ## Design rule
 
 Prefer a generic configurable representation whenever a protocol difference can be described as data or an orthogonal capability. Do not use coin tickers as switches in common code when an explicit capability can express the same requirement. A tightly coupled consensus feature may have its own named capability only when decomposing it would make correctness harder to reason about.
+
+
+## Hosted regression matrix
+
+The source-level qualification matrix intentionally tests protocol profiles rather than branching on coin names. `test/chain_profiles.c` runs each profile in a fresh child process so startup-static configuration cannot bleed between cases.
+
+| Lane | Generic profile exercised in hosted tests | Prior live/provenance evidence |
+| --- | --- | --- |
+| BTC | all optional multichain capabilities unset | upstream default contract |
+| DGB | Bitcoin-default consensus capabilities | deployed with upstream binary |
+| AUR | Bitcoin-default consensus capabilities | deployed with upstream binary |
+| BFX | Bitcoin-default consensus capabilities | deployed with upstream binary |
+| LCC | Bitcoin-default serialization; SHA256d GBT selection remains `gbtparams.powalgo` | unified fork already mined an accepted main-chain block at height 4507116 |
+| BCH | `cashaddr_prefix=bitcoincash`; request profile drops `rules` | deployed `skaisser/ckpool` lineage audited for BCH protocol deltas |
+| PPC | `coinbase_txntime`, `block_suffix=00`, `validate_coinbase=false` | 51 consecutive qualified testnet blocks on the retained keyless lineage |
+| XEC | eCash CashAddr, mandatory GBT outputs, RTT target, `preciousblock=false` | fields and output ordering cross-checked against Bitcoin ABC GBT and reference ckpool |
+
+The hosted matrix additionally checks missing RTT-target fallback and the maximum configured 512-byte script boundary. Hosted success is a source/build regression gate, not a substitute for the final ARM64 and live-node acceptance pass.

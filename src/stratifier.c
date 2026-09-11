@@ -718,7 +718,10 @@ static void generate_coinbase(workbase_t *wb)
 	/* Coinb2 address goes here, takes up 23~25 bytes + 1 byte for length */
 
 	wb->coinb3len = 0;
-	wb->coinb3bin = ckzalloc(512 + wb->mandatory_outputs * (8 + 1 + MAX_GBT_OUTPUT_SCRIPT_LEN) +
+	/* A configured script may be up to 512 bytes, which uses the three-byte
+	 * CompactSize form (0xfd + uint16). Reserve for the largest wire form,
+	 * not merely the one-byte prefix used by normal P2PKH/P2SH outputs. */
+	wb->coinb3bin = ckzalloc(512 + wb->mandatory_outputs * (8 + 3 + MAX_GBT_OUTPUT_SCRIPT_LEN) +
 			       wb->insert_witness * (8 + witnessdata_size + 2));
 
 	if (ckpool.donvalid && ckpool.donation > 0) {
@@ -738,9 +741,8 @@ static void generate_coinbase(workbase_t *wb)
 		u64 = htole64(output->amount);
 		memcpy(wb->coinb3bin + wb->coinb3len, &u64, sizeof(uint64_t));
 		wb->coinb3len += sizeof(uint64_t);
-		/* Configured mandatory scripts are bounded below CompactSize's 0xfd
-		 * threshold by MAX_GBT_OUTPUT_SCRIPT_LEN only in storage; encode the
-		 * full CompactSize form here so the generic path is not chain-sized. */
+		/* Encode full CompactSize so the generic path also handles configured
+		 * scripts at and above the 0xfd threshold. */
 		if (output->script_len < 0xfd) {
 			wb->coinb3bin[wb->coinb3len++] = output->script_len;
 		} else {
