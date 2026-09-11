@@ -96,6 +96,22 @@ The remaining implementation work therefore belongs to four generic layers:
 3. **Coinbase/block capabilities**: optional transaction timestamp, optional block suffix, and configurable mandatory outputs sourced from GBT.
 4. **Mining semantics**: selectable target source, selectable post-submit chain-tip behavior, and strict per-client SV1 version-mask negotiation/reconstruction.
 
+## Peercoin serialization profile
+
+The previously qualified keyless Peercoin path is represented without a Peercoin code branch:
+
+```json
+{
+  "coinbase_txntime": true,
+  "block_suffix": "00",
+  "validate_coinbase": false
+}
+```
+
+`coinbase_txntime` inserts the template nTime after the transaction version in the coinbase transaction. `block_suffix` appends opaque validated hex after the transaction vector; `00` is the empty trailing block-signature vector required by the qualified PoW CBlock serialization. `validate_coinbase:false` honestly skips the daemon `decoderawtransaction` startup check for transaction formats the daemon RPC does not decode; it does not fabricate a successful RPC response. Block submission and consensus acceptance remain authoritative. The default values preserve Bitcoin behavior.
+
+`preciousblock` is also a generic boolean capability and defaults to `true`. Setting it to `false` suppresses the post-submit chain-tip hint without affecting `submitblock` itself.
+
 ## Public repository boundary
 
 These settings contain protocol configuration only. Runtime credentials, payout private keys, private network addresses, node cookies, host-specific paths, live service configuration and recovery material must not be committed to this public repository. This repository must never use self-hosted GitHub Actions runners.

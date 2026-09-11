@@ -31,6 +31,7 @@
 #include "ckpool.h"
 #include "libckpool.h"
 #include "bitcoin.h"
+#include "multichain.h"
 #include "sha2.h"
 #include "bip310.h"
 #include "stratifier.h"
@@ -600,6 +601,7 @@ static void generate_coinbase(workbase_t *wb)
 	uint32_t u32;
 	sdata_t *sdata = ckpool.sdata;
 	char header[272];
+	int header_len, script_len_pos;
 	int len, ofs = 0;
 	ts_t now;
 
@@ -608,11 +610,21 @@ static void generate_coinbase(workbase_t *wb)
 	wb->coinb1bin = ckzalloc(128);
 
 	/* Strings in wb should have been zero memset prior. Generate binary
-	 * templates first, then convert to hex */
-	memcpy(wb->coinb1bin, scriptsig_header_bin, 41);
-	ofs += 41; // Fixed header length;
+	 * templates first, then convert to hex. Some Bitcoin-derived transaction
+	 * formats carry a transaction nTime directly after nVersion. */
+	if (multichain_coinbase_txntime()) {
+		u32 = htole32(wb->ntime32);
+		memcpy(wb->coinb1bin, scriptsig_header_bin, 4);
+		memcpy(wb->coinb1bin + 4, &u32, sizeof(u32));
+		memcpy(wb->coinb1bin + 8, scriptsig_header_bin + 4, 37);
+		header_len = 45;
+	} else {
+		memcpy(wb->coinb1bin, scriptsig_header_bin, 41);
+		header_len = 41;
+	}
+	ofs = header_len;
 
-	ofs++; // Script length is filled in at the end @wb->coinb1bin[41];
+	script_len_pos = ofs++; // Script length is filled in at the end.
 
 	/* Put block height at start of template */
 	if (unlikely(ckpool.regtest))
@@ -648,7 +660,7 @@ static void generate_coinbase(workbase_t *wb)
 
 	wb->coinb1len = ofs;
 
-	len = wb->coinb1len - 41;
+	len = wb->coinb1len - header_len;
 
 	len += wb->enonce1varlen;
 	len += wb->enonce2varlen;
@@ -668,7 +680,7 @@ static void generate_coinbase(workbase_t *wb)
 	}
 	len += wb->coinb2len;
 
-	wb->coinb1bin[41] = len - 1; /* Set the length now */
+	wb->coinb1bin[script_len_pos] = len - 1; /* Set the length now */
 	__bin2hex(wb->coinb1, wb->coinb1bin, wb->coinb1len);
 	LOGDEBUG("Coinb1: %s", wb->coinb1);
 	/* Coinbase 1 complete */
@@ -754,15 +766,19 @@ static void generate_coinbase(workbase_t *wb)
 			cb = bin2hex(coinbase, offset);
 			LOGDEBUG("Coinbase txn %s", cb);
 			free(coinbase);
-			cbstr = generator_checktxn(cb);
-			if (cbstr) {
-				LOGNOTICE("Coinbase transaction confirmed valid");
-				LOGDEBUG("%s", cbstr);
-				free(cbstr);
+			if (!multichain_validate_coinbase()) {
+				LOGNOTICE("Coinbase RPC transaction validation disabled by configuration");
 			} else {
-				/* This is a fatal error */
-				LOGEMERG("Coinbase failed valid transaction check, aborting!");
-				exit(1);
+				cbstr = generator_checktxn(cb);
+				if (cbstr) {
+					LOGNOTICE("Coinbase transaction confirmed valid");
+					LOGDEBUG("%s", cbstr);
+					free(cbstr);
+				} else {
+					/* This is a fatal error */
+					LOGEMERG("Coinbase failed valid transaction check, aborting!");
+					exit(1);
+				}
 			}
 			free(cb);
 			ckpool.coinbase_valid = true;
@@ -2405,6 +2421,8 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 	strcat(gbt_block, hexcoinbase);
 	if (wb->txns)
 		realloc_strcat(&gbt_block, wb->txn_data);
+	if (multichain_block_suffix())
+		realloc_strcat(&gbt_block, multichain_block_suffix());
 	return gbt_block;
 }
 
@@ -2418,7 +2436,8 @@ static bool local_block_submit(char *gbt_block, const uchar *flip32, int height)
 	free(gbt_block);
 	swap_256(swap256, flip32);
 	__bin2hex(rhash, swap256, 32);
-	generator_preciousblock(rhash);
+	if (multichain_preciousblock())
+		generator_preciousblock(rhash);
 
 	/* Check failures that may be inconclusive but were submitted via other
 	 * means or accepted due to precious block call. */
