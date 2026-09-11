@@ -47,6 +47,21 @@ jobs:
           git config user.name "Samuel Castel"
           git config user.email "2681949+samuelcstl@users.noreply.github.com"
 
+      - name: Point patch driver at clean target checkout
+        working-directory: src
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('../patcher/tools/agent_multichain_complete.py')
+          s = p.read_text()
+          old = 'ROOT = Path(__file__).resolve().parents[1]'
+          new = 'ROOT = Path.cwd()'
+          if s.count(old) != 1:
+              raise SystemExit(f'expected exactly one patch-root marker, got {s.count(old)}')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
       - name: Phase 1 - generic capability framework
         working-directory: src
         run: |
