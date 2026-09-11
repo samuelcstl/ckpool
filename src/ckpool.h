@@ -264,6 +264,7 @@ struct ckpool_instance {
 	int64_t maxdiff; // No default
 
 	/* Coinbase data */
+	char *cashaddr_prefix; // Optional CashAddr HRP; NULL preserves upstream address behaviour
 	char *btcaddress; // Address to mine to
 	bool script; // Address is a script address
 	bool segwit; // Address is a segwit address

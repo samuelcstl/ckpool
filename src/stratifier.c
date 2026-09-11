@@ -31,6 +31,7 @@
 #include "ckpool.h"
 #include "libckpool.h"
 #include "bitcoin.h"
+#include "cashaddr.h"
 #include "sha2.h"
 #include "bip310.h"
 #include "stratifier.h"
@@ -47,6 +48,22 @@
 static const char *workpadding = "000000800000000000000000000000000000000000000000000000000000000000000000000000000000000080020000";
 static const char *scriptsig_header = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff";
 static uchar scriptsig_header_bin[41];
+
+/* Convert a configured/user payout address to scriptPubKey. CashAddr is an
+ * optional orthogonal codec; when unset or when the address is not CashAddr,
+ * preserve the normal Base58/SegWit path byte-for-byte. */
+static int payout_address_to_txn(char *p2h, const char *addr, const bool script, const bool segwit)
+{
+	if (ckpool.cashaddr_prefix) {
+		bool cash_script;
+		int len = cashaddr_to_script(addr, ckpool.cashaddr_prefix, (uint8_t *)p2h, &cash_script);
+
+		if (len)
+			return len;
+	}
+	return address_to_txn(p2h, addr, script, segwit);
+}
+
 static const double nonces = 4294967296;
 
 /* Add unaccounted shares when they arrive, remove them with each update of
@@ -6253,7 +6270,7 @@ static user_instance_t *generate_user(stratum_instance_t *client,
 		/* Is this a btc address based username? */
 		if (generator_checkaddr(username, &user->script, &user->segwit)) {
 			user->btcaddress = true;
-			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
+			user->txnlen = payout_address_to_txn(user->txnbin, username, user->script, user->segwit);
 		}
 	}
 	if (new_user) {
@@ -8666,7 +8683,7 @@ static user_instance_t *generate_remote_user(const char *workername)
 		/* Is this a btc address based username? */
 		if (generator_checkaddr(username, &user->script, &user->segwit)) {
 			user->btcaddress = true;
-			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
+			user->txnlen = payout_address_to_txn(user->txnbin, username, user->script, user->segwit);
 		}
 	}
 	if (new_user) {
@@ -10708,22 +10725,22 @@ void *stratifier(void *arg)
 
 		/* Store this for use elsewhere */
 		hex2bin(scriptsig_header_bin, scriptsig_header, 41);
-		sdata->txnlen = address_to_txn(sdata->txnbin, ckpool.btcaddress, ckpool.script, ckpool.segwit);
+		sdata->txnlen = payout_address_to_txn(sdata->txnbin, ckpool.btcaddress, ckpool.script, ckpool.segwit);
 
 		/* Find a valid donation address if possible */
 		if (generator_checkaddr(ckpool.donaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donvalid = true;
-			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
+			sdata->dontxnlen = payout_address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
 			LOGNOTICE("BTC donation address valid %s", ckpool.donaddress);
 		} else if (generator_checkaddr(ckpool.tndonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donaddress = ckpool.tndonaddress;
 			ckpool.donvalid = true;
-			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
+			sdata->dontxnlen = payout_address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
 			LOGNOTICE("BTC testnet donation address valid %s", ckpool.donaddress);
 		} else if (generator_checkaddr(ckpool.rtdonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donaddress = ckpool.rtdonaddress;
 			ckpool.donvalid = true;
-			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
+			sdata->dontxnlen = payout_address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
 			LOGNOTICE("BTC regtest donation address valid %s", ckpool.donaddress);
 			ckpool.regtest = true;
 		} else

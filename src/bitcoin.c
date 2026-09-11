@@ -14,6 +14,7 @@
 #include "ckpool.h"
 #include "libckpool.h"
 #include "bitcoin.h"
+#include "cashaddr.h"
 #include "stratifier.h"
 #include "yyjson.h"
 
@@ -36,7 +37,10 @@ bool validate_address(connsock_t *cs, const char *address, bool *script, bool *s
 {
 	yyjson_doc *doc;
 	yyjson_val *root, *res_val, *valid_val, *tmp_val;
-	char rpc_req[128];
+	char rpc_req[256], normalized[196];
+	const char *rpc_address = address;
+	uint8_t cash_hash[20];
+	bool cash_script = false, is_cashaddr = false;
 	bool ret = false;
 
 	if (unlikely(!address)) {
@@ -44,7 +48,18 @@ bool validate_address(connsock_t *cs, const char *address, bool *script, bool *s
 		return ret;
 	}
 
-	snprintf(rpc_req, 128, "{\"method\": \"validateaddress\", \"params\": [\"%s\"]}\n", address);
+	/* When configured, recognise CashAddr locally and canonicalise bare or
+	 * uppercase forms before asking the daemon to validate the address. */
+	if (ckpool.cashaddr_prefix &&
+	    cashaddr_decode(address, ckpool.cashaddr_prefix, cash_hash, &cash_script) &&
+	    cashaddr_normalize(normalized, sizeof(normalized), address, ckpool.cashaddr_prefix)) {
+		is_cashaddr = true;
+		rpc_address = normalized;
+	}
+
+	snprintf(rpc_req, sizeof(rpc_req),
+		 "{\"method\": \"validateaddress\", \"params\": [\"%s\"]}\n",
+		 rpc_address);
 	doc = yyjson_rpc_response(cs, rpc_req);
 	if (!doc) {
 		/* May get a parse error with an invalid address */
@@ -72,6 +87,11 @@ bool validate_address(connsock_t *cs, const char *address, bool *script, bool *s
 		goto out;
 	}
 	ret = true;
+	if (is_cashaddr) {
+		*script = cash_script;
+		*segwit = false;
+		goto out;
+	}
 	tmp_val = yyjson_obj_get(res_val, "isscript");
 	if (unlikely(!tmp_val)) {
 		/* All recent bitcoinds with wallet support built in should

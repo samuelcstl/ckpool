@@ -1730,6 +1730,12 @@ static void parse_config(void)
 		if (arr_size)
 			parse_btcds(arr_val, arr_size);
 	}
+	yyjson_obj_get_string(&ckpool.cashaddr_prefix, json_conf, "cashaddr_prefix");
+	if (ckpool.cashaddr_prefix &&
+	    (!ckpool.cashaddr_prefix[0] || strlen(ckpool.cashaddr_prefix) > 83 ||
+	     strchr(ckpool.cashaddr_prefix, ':'))) {
+		quit(1, "Invalid cashaddr_prefix %s", ckpool.cashaddr_prefix);
+	}
 	yyjson_obj_get_string(&ckpool.btcaddress, json_conf, "btcaddress");
 	yyjson_obj_get_string(&ckpool.btcsig, json_conf, "btcsig");
 	if (ckpool.btcsig && strlen(ckpool.btcsig) > 38) {
@@ -2009,6 +2015,7 @@ static void report_config(void)
 #endif
 	       );
 
+	printf("cashaddr_prefix = %s\n", ckpool.cashaddr_prefix ? ckpool.cashaddr_prefix : "(none)");
 	printf("btcaddress = %s\n", ckpool.btcaddress ? ckpool.btcaddress : "(none)");
 	printf("btcsig = %s\n", ckpool.btcsig ? ckpool.btcsig : "(none)");
 	printf("donation = %.2f\n", ckpool.donation);
