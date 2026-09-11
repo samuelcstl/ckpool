@@ -31,7 +31,9 @@
 #include "ckpool.h"
 #include "libckpool.h"
 #include "bitcoin.h"
+#include "multichain.h"
 #include "sha2.h"
+#include "bip310.h"
 #include "stratifier.h"
 #include "uthash.h"
 #include "utlist.h"
@@ -306,6 +308,11 @@ struct stratum_instance {
 
 	int64_t suggest_diff; /* Stratum client suggested diff */
 	double best_diff; /* Best share found by this instance */
+
+	/* BIP310 version rolling is negotiated per connection. */
+	bool version_rolling;
+	uint32_t version_mask; /* Last mask returned to this miner. */
+	unsigned int version_min_bit_count; /* Diagnostic request, 0 if omitted. */
 
 	sdata_t *sdata; /* Which sdata this client is bound to */
 	proxy_t *proxy; /* Proxy this is bound to in proxy mode */
@@ -590,10 +597,13 @@ static int ser_bip34_height(uint8_t *buf, uint32_t height)
 
 static void generate_coinbase(workbase_t *wb)
 {
-	uint64_t u64, g64, d64 = 0;
+	uint64_t u64, g64, d64 = 0, mandatory_total = 0;
 	uint32_t u32;
+	uint8_t txout_count;
+	int i;
 	sdata_t *sdata = ckpool.sdata;
 	char header[272];
+	int header_len, script_len_pos;
 	int len, ofs = 0;
 	ts_t now;
 
@@ -602,11 +612,21 @@ static void generate_coinbase(workbase_t *wb)
 	wb->coinb1bin = ckzalloc(128);
 
 	/* Strings in wb should have been zero memset prior. Generate binary
-	 * templates first, then convert to hex */
-	memcpy(wb->coinb1bin, scriptsig_header_bin, 41);
-	ofs += 41; // Fixed header length;
+	 * templates first, then convert to hex. Some Bitcoin-derived transaction
+	 * formats carry a transaction nTime directly after nVersion. */
+	if (multichain_coinbase_txntime()) {
+		u32 = htole32(wb->ntime32);
+		memcpy(wb->coinb1bin, scriptsig_header_bin, 4);
+		memcpy(wb->coinb1bin + 4, &u32, sizeof(u32));
+		memcpy(wb->coinb1bin + 8, scriptsig_header_bin + 4, 37);
+		header_len = 45;
+	} else {
+		memcpy(wb->coinb1bin, scriptsig_header_bin, 41);
+		header_len = 41;
+	}
+	ofs = header_len;
 
-	ofs++; // Script length is filled in at the end @wb->coinb1bin[41];
+	script_len_pos = ofs++; // Script length is filled in at the end.
 
 	/* Put block height at start of template */
 	if (unlikely(ckpool.regtest))
@@ -642,7 +662,7 @@ static void generate_coinbase(workbase_t *wb)
 
 	wb->coinb1len = ofs;
 
-	len = wb->coinb1len - 41;
+	len = wb->coinb1len - header_len;
 
 	len += wb->enonce1varlen;
 	len += wb->enonce2varlen;
@@ -662,7 +682,7 @@ static void generate_coinbase(workbase_t *wb)
 	}
 	len += wb->coinb2len;
 
-	wb->coinb1bin[41] = len - 1; /* Set the length now */
+	wb->coinb1bin[script_len_pos] = len - 1; /* Set the length now */
 	__bin2hex(wb->coinb1, wb->coinb1bin, wb->coinb1len);
 	LOGDEBUG("Coinb1: %s", wb->coinb1);
 	/* Coinbase 1 complete */
@@ -671,16 +691,25 @@ static void generate_coinbase(workbase_t *wb)
 	memcpy(wb->coinb2bin + wb->coinb2len, "\xff\xff\xff\xfe", 4);
 	wb->coinb2len += 4;
 
-	// Generation value
+	/* Generation value after any consensus-mandatory GBT outputs. */
 	g64 = wb->coinbasevalue;
+	for (i = 0; i < wb->mandatory_outputs; i++) {
+		mandatory_total += wb->mandatory_output[i].amount;
+		if (unlikely(mandatory_total > wb->coinbasevalue)) {
+			LOGEMERG("Mandatory GBT outputs exceed coinbasevalue");
+			exit(1);
+		}
+	}
+	g64 -= mandatory_total;
+	txout_count = 1 + wb->mandatory_outputs + wb->insert_witness;
 	if (ckpool.donvalid && ckpool.donation > 0) {
 		double dbl64 = (double)g64 / 100 * ckpool.donation;
 
 		d64 = dbl64;
 		g64 -= d64; // To guarantee integers add up to the original coinbasevalue
-		wb->coinb2bin[wb->coinb2len++] = 2 + wb->insert_witness;
-	} else
-		wb->coinb2bin[wb->coinb2len++] = 1 + wb->insert_witness;
+		txout_count++;
+	}
+	wb->coinb2bin[wb->coinb2len++] = txout_count;
 
 	u64 = htole64(g64);
 	memcpy(&wb->coinb2bin[wb->coinb2len], &u64, sizeof(uint64_t));
@@ -689,7 +718,11 @@ static void generate_coinbase(workbase_t *wb)
 	/* Coinb2 address goes here, takes up 23~25 bytes + 1 byte for length */
 
 	wb->coinb3len = 0;
-	wb->coinb3bin = ckzalloc(256 + wb->insert_witness * (8 + witnessdata_size + 2));
+	/* A configured script may be up to 512 bytes, which uses the three-byte
+	 * CompactSize form (0xfd + uint16). Reserve for the largest wire form,
+	 * not merely the one-byte prefix used by normal P2PKH/P2SH outputs. */
+	wb->coinb3bin = ckzalloc(512 + wb->mandatory_outputs * (8 + 3 + MAX_GBT_OUTPUT_SCRIPT_LEN) +
+			       wb->insert_witness * (8 + witnessdata_size + 2));
 
 	if (ckpool.donvalid && ckpool.donation > 0) {
 		u64 = htole64(d64);
@@ -701,6 +734,27 @@ static void generate_coinbase(workbase_t *wb)
 		wb->coinb3len += sdata->dontxnlen;
 	} else
 		ckpool.donation = 0;
+
+	for (i = 0; i < wb->mandatory_outputs; i++) {
+		const struct gbt_coinbase_output *output = &wb->mandatory_output[i];
+
+		u64 = htole64(output->amount);
+		memcpy(wb->coinb3bin + wb->coinb3len, &u64, sizeof(uint64_t));
+		wb->coinb3len += sizeof(uint64_t);
+		/* Encode full CompactSize so the generic path also handles configured
+		 * scripts at and above the 0xfd threshold. */
+		if (output->script_len < 0xfd) {
+			wb->coinb3bin[wb->coinb3len++] = output->script_len;
+		} else {
+			uint16_t slen = htole16(output->script_len);
+
+			wb->coinb3bin[wb->coinb3len++] = 0xfd;
+			memcpy(wb->coinb3bin + wb->coinb3len, &slen, sizeof(slen));
+			wb->coinb3len += sizeof(slen);
+		}
+		memcpy(wb->coinb3bin + wb->coinb3len, output->script, output->script_len);
+		wb->coinb3len += output->script_len;
+	}
 
 	if (wb->insert_witness) {
 		// 0 value
@@ -748,15 +802,19 @@ static void generate_coinbase(workbase_t *wb)
 			cb = bin2hex(coinbase, offset);
 			LOGDEBUG("Coinbase txn %s", cb);
 			free(coinbase);
-			cbstr = generator_checktxn(cb);
-			if (cbstr) {
-				LOGNOTICE("Coinbase transaction confirmed valid");
-				LOGDEBUG("%s", cbstr);
-				free(cbstr);
+			if (!multichain_validate_coinbase()) {
+				LOGNOTICE("Coinbase RPC transaction validation disabled by configuration");
 			} else {
-				/* This is a fatal error */
-				LOGEMERG("Coinbase failed valid transaction check, aborting!");
-				exit(1);
+				cbstr = generator_checktxn(cb);
+				if (cbstr) {
+					LOGNOTICE("Coinbase transaction confirmed valid");
+					LOGDEBUG("%s", cbstr);
+					free(cbstr);
+				} else {
+					/* This is a fatal error */
+					LOGEMERG("Coinbase failed valid transaction check, aborting!");
+					exit(1);
+				}
 			}
 			free(cb);
 			ckpool.coinbase_valid = true;
@@ -1125,7 +1183,8 @@ static void add_base(sdata_t *sdata, workbase_t *wb, bool *new_block)
 	 * value. Share validation and block-solve checks always use
 	 * wb->network_diff / current_workbase->network_diff on the client's
 	 * bound sdata, so mixed-network proxies remain correct. */
-	wb->network_diff = diff_from_nbits(wb->headerbin + 72);
+	wb->network_diff = wb->effective_diff > 0 ? wb->effective_diff :
+		diff_from_nbits(wb->headerbin + 72);
 	if (wb->network_diff < 1)
 		wb->network_diff = 1;
 	stats->network_diff = wb->network_diff;
@@ -2209,8 +2268,8 @@ static void add_node_base(yyjson_mut_val *val, bool trusted, int64_t client_id)
 /* Calculate share diff and fill in hash and swap. Need to hold workbase read count */
 static double
 share_diff(char *coinbase, const uchar *enonce1bin, const workbase_t *wb, const char *nonce2,
-	   const uint32_t ntime32, uint32_t version_mask, const char *nonce,
-	   uchar *hash, uchar *swap, int *cblen)
+	   const uint32_t ntime32, const uint32_t version_bits, const uint32_t version_mask,
+	   const char *nonce, uchar *hash, uchar *swap, int *cblen)
 {
 	unsigned char merkle_root[32], merkle_sha[64];
 	uint32_t *data32, *swap32, benonce32;
@@ -2242,11 +2301,13 @@ share_diff(char *coinbase, const uchar *enonce1bin, const workbase_t *wb, const 
 	memcpy(data, wb->headerbin, 80);
 	memcpy(data + 36, merkle_root, 32);
 
-	/* Update nVersion when version_mask is in use */
+	/* Reconstruct BIP310 nVersion with replacement semantics. A submitted zero
+	 * bit inside the effective mask must clear the corresponding template bit. */
 	if (version_mask) {
-		version_mask = htobe32(version_mask);
+		uint32_t version = bip310_apply_version(wb->version, version_mask, version_bits);
+
 		data32 = (uint32_t *)data;
-		*data32 |= version_mask;
+		*data32 = htobe32(version);
 	}
 
 	/* Insert the nonce value into the data */
@@ -2329,9 +2390,10 @@ static void send_nodes_block(sdata_t *sdata, yyjson_mut_doc *block_doc, const in
 
 /* Entered with workbase readcount. */
 static void send_node_block(sdata_t *sdata, const char *enonce1, const char *nonce,
-			    const char *nonce2, const uint32_t ntime32, const uint32_t version_mask,
-			    const int64_t jobid, const double diff, const int64_t client_id,
-			    const char *coinbase, const int cblen, const uchar *data)
+			    const char *nonce2, const uint32_t ntime32, const uint32_t version_bits,
+			    const uint32_t version_mask, const int64_t jobid, const double diff,
+			    const int64_t client_id, const char *coinbase, const int cblen,
+			    const uchar *data)
 {
 	if (sdata->node_instances) {
 		yyjson_mut_doc *doc = yyjson_mut_doc_new(&ckyyalc);
@@ -2342,7 +2404,12 @@ static void send_node_block(sdata_t *sdata, const char *enonce1, const char *non
 		yyjson_mut_obj_add_strcpy(doc, val, "nonce", nonce);
 		yyjson_mut_obj_add_strcpy(doc, val, "nonce2", nonce2);
 		yyjson_mut_obj_add_uint(doc, val, "ntime32", ntime32);
-		yyjson_mut_obj_add_uint(doc, val, "version_mask", version_mask);
+		/* Keep version_mask as the legacy version-bits field for compatibility
+		 * with older trusted nodes, while carrying the exact negotiated mask
+		 * separately for strict replacement reconstruction. */
+		yyjson_mut_obj_add_uint(doc, val, "version_mask", version_bits);
+		yyjson_mut_obj_add_uint(doc, val, "version_bits", version_bits);
+		yyjson_mut_obj_add_uint(doc, val, "version_effective_mask", version_mask);
 		yyjson_mut_obj_add_int(doc, val, "jobid", jobid);
 		yyjson_mut_obj_add_real(doc, val, "diff", diff);
 		add_remote_blockdata(doc, val, cblen, coinbase, data);
@@ -2391,6 +2458,8 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 	strcat(gbt_block, hexcoinbase);
 	if (wb->txns)
 		realloc_strcat(&gbt_block, wb->txn_data);
+	if (multichain_block_suffix())
+		realloc_strcat(&gbt_block, multichain_block_suffix());
 	return gbt_block;
 }
 
@@ -2404,7 +2473,8 @@ static bool local_block_submit(char *gbt_block, const uchar *flip32, int height)
 	free(gbt_block);
 	swap_256(swap256, flip32);
 	__bin2hex(rhash, swap256, 32);
-	generator_preciousblock(rhash);
+	if (multichain_preciousblock())
+		generator_preciousblock(rhash);
 
 	/* Check failures that may be inconclusive but were submitted via other
 	 * means or accepted due to precious block call. */
@@ -2484,7 +2554,7 @@ static void submit_node_block(sdata_t *sdata, yyjson_mut_val *val)
 	char *coinbase = NULL, *enonce1 = NULL, *nonce = NULL, *nonce2 = NULL, *gbt_block,
 		*coinbasehex, *swaphex;
 	uchar *enonce1bin = NULL, hash[32], swap[80], flip32[32];
-	uint32_t ntime32, version_mask = 0;
+	uint32_t ntime32, version_bits = 0, version_mask = 0;
 	char blockhash[68], cdfield[64];
 	int enonce1len, cblen = 0;
 	workbase_t *wb = NULL;
@@ -2519,9 +2589,21 @@ static void submit_node_block(sdata_t *sdata, yyjson_mut_val *val)
 		goto out;
 	}
 
-	if (!yyjson_mut_obj_get_uint32(&version_mask, val, "version_mask")) {
-		/* No version mask is not fatal, assume it to be zero */
-		LOGINFO("No version mask in node method block");
+	if (!yyjson_mut_obj_get_uint32(&version_bits, val, "version_bits") &&
+	    !yyjson_mut_obj_get_uint32(&version_bits, val, "version_mask")) {
+		/* No version bits is not fatal, assume an unrolled template version. */
+		LOGINFO("No version bits in node method block");
+	}
+	if (!yyjson_mut_obj_get_uint32(&version_mask, val, "version_effective_mask")) {
+		/* Legacy trusted nodes only transported submitted bits. The exact
+		 * negotiated mask cannot be recovered, so use the configured pool
+		 * mask as the strictest reconstruction policy available. */
+		version_mask = version_bits ? ckpool.version_mask : 0;
+	}
+	if (unlikely(!bip310_version_bits_valid(version_bits, version_mask))) {
+		LOGWARNING("Invalid version bits %08x outside effective mask %08x in node block",
+			   version_bits, version_mask);
+		goto out;
 	}
 
 	LOGWARNING("Possible upstream block solve diff %lf !", diff);
@@ -2567,7 +2649,8 @@ static void submit_node_block(sdata_t *sdata, yyjson_mut_val *val)
 		}
 		coinbase = alloca(wb->coinb1len + wb->enonce1constlen + wb->enonce1varlen + wb->enonce2varlen + wb->coinb2len);
 		/* Fill in the hashes */
-		share_diff(coinbase, enonce1bin, wb, nonce2, ntime32, version_mask, nonce, hash, swap, &cblen);
+		share_diff(coinbase, enonce1bin, wb, nonce2, ntime32, version_bits, version_mask,
+			   nonce, hash, swap, &cblen);
 	}
 
 	/* Now we have enough to assemble a block */
@@ -6187,6 +6270,29 @@ static worker_instance_t *get_worker(sdata_t *sdata, user_instance_t *user, cons
 	return get_create_worker(sdata, user, workername, &dummy);
 }
 
+/* Prefer the configured local payout codec when it can prove an address is
+ * valid. Everything else stays on the upstream daemon-validation path. */
+static bool payout_address_valid(const char *address, bool *script, bool *segwit)
+{
+	char txnbin[256];
+
+	if (payout_address_is_cashaddr(address, script, segwit))
+		return true;
+	if (!generator_checkaddr(address, script, segwit))
+		return false;
+	/* With an opt-in local payout codec, do not admit a newer daemon-
+	 * accepted address form unless the exact serializer we will use for
+	 * coinbase construction can encode it too. Default Bitcoin behavior
+	 * remains unchanged when no local codec is configured. */
+	if (payout_local_codec_enabled() &&
+	    payout_address_to_txn(txnbin, address, *script, *segwit) <= 0) {
+		LOGWARNING("Node accepted payout address unsupported by configured codec: %s",
+			   address);
+		return false;
+	}
+	return true;
+}
+
 /* This simply strips off the first part of the workername and matches it to a
  * user or creates a new one. Needs to be entered with client holding a ref
  * count. */
@@ -6224,7 +6330,7 @@ static user_instance_t *generate_user(stratum_instance_t *client,
 
 	if (!ckpool.proxy && (new_user || !user->btcaddress)) {
 		/* Is this a btc address based username? */
-		if (generator_checkaddr(username, &user->script, &user->segwit)) {
+		if (payout_address_valid(username, &user->script, &user->segwit)) {
 			user->btcaddress = true;
 			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
 		}
@@ -6674,8 +6780,8 @@ static bool ipc_submit_block(const workbase_t *wb, const uchar *data, const char
 static void
 test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uchar *data,
 		const uchar *hash, const double diff, const char *coinbase, int cblen,
-		const char *nonce2, const char *nonce, const uint32_t ntime32, const uint32_t version_mask,
-		const bool stale)
+		const char *nonce2, const char *nonce, const uint32_t ntime32,
+		const uint32_t version_bits, const uint32_t version_mask, const bool stale)
 {
 	char blockhash[68], cdfield[64], *gbt_block;
 	sdata_t *sdata = client->sdata;
@@ -6720,8 +6826,8 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	} else
 #endif
 		gbt_block = process_block(wb, coinbase, cblen, data, hash, flip32, blockhash);
-	send_node_block(sdata, client->enonce1, nonce, nonce2, ntime32, version_mask,
-			wb->id, diff, client->id, coinbase, cblen, data);
+	send_node_block(sdata, client->enonce1, nonce, nonce2, ntime32, version_bits,
+			version_mask, wb->id, diff, client->id, coinbase, cblen, data);
 
 	doc = yyjson_mut_doc_new(&ckyyalc);
 	val = yyjson_mut_obj(doc);
@@ -6797,7 +6903,8 @@ out_nouserwb:
 
 /* Needs to be entered with workbase readcount and client holding a ref count.
  * If full_version is true, version_field replaces the header nVersion entirely
- * (SV2 SubmitShares). Otherwise version_field is a BIP320 mask OR'd in (SV1). */
+ * (SV2 SubmitShares). Otherwise version_field is BIP310 version_bits and is
+ * applied with the per-client negotiated mask. */
 static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, const workbase_t *wb,
 			      const char *nonce2, const uint32_t ntime32, uint32_t version_field,
 			      const bool full_version, const char *nonce, uchar *hash,
@@ -6846,15 +6953,17 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 	memcpy(data, wb->headerbin, 80);
 	memcpy(data + 36, merkle_root, 32);
 
-	/* nVersion: full replace (SV2) or BIP320 mask OR (SV1) */
+	/* nVersion: full replace for SV2; strict BIP310 replacement for SV1.
+	 * A zero in version_bits must clear a job bit inside the negotiated mask,
+	 * hence OR semantics are incorrect here. */
+	data32 = (uint32_t *)data;
 	if (full_version) {
-		data32 = (uint32_t *)data;
 		*data32 = htobe32(version_field);
-	} else if (version_field) {
-		uint32_t version_mask = htobe32(version_field);
+	} else if (client->version_rolling) {
+		uint32_t version = bip310_apply_version(wb->version, client->version_mask,
+						   version_field);
 
-		data32 = (uint32_t *)data;
-		*data32 |= version_mask;
+		*data32 = htobe32(version);
 	}
 
 	/* Insert the nonce value into the data */
@@ -6878,7 +6987,8 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 
 	/* Test we haven't solved a block regardless of share status */
 	test_blocksolve(client, wb, swap, hash, ret, coinbase, cblen, nonce2, nonce, ntime32,
-			full_version ? 0 : version_field, stale);
+			full_version ? 0 : version_field,
+			(!full_version && client->version_rolling) ? client->version_mask : 0, stale);
 
 	return ret;
 }
@@ -7638,12 +7748,12 @@ static bool parse_submit(stratum_instance_t *client, yyjson_mut_val *params_val,
 			 enum share_err *err_code)
 {
 	bool share = false, result = false, invalid = true, submit = false, stale = false;
-	const char *workername, *job_id, *ntime, *version_mask;
+	const char *workername, *job_id, *ntime, *version_bits;
 	double diff = client->diff, wdiff = 0, sdiff = -1;
 	char hexhash[68] = {}, sharehash[32], cdfield[64];
 	user_instance_t *user = client->user_instance;
 	char *fname = NULL, *nonce, *nonce2;
-	uint32_t ntime32, version_mask32 = 0;
+	uint32_t ntime32, version_bits32 = 0;
 	sdata_t *sdata = client->sdata;
 	enum share_err err = SE_NONE;
 	char idstring[24] = {};
@@ -7694,15 +7804,20 @@ static bool parse_submit(stratum_instance_t *client, yyjson_mut_val *params_val,
 		goto out;
 	}
 
-	version_mask = yyjson_mut_get_str(yyjson_mut_arr_get(params_val, 5));
-	if (version_mask && strlen(version_mask) && validhex(version_mask)) {
-		sscanf(version_mask, "%x", &version_mask32);
-		// check version mask
-		if (version_mask32 && ((~ckpool.version_mask) & version_mask32) != 0) {
-			// means client changed some bits which server doesn't allow to change
+	version_bits = yyjson_mut_get_str(yyjson_mut_arr_get(params_val, 5));
+	if (client->version_rolling) {
+		/* BIP310 activates exactly one extra mining.submit parameter. */
+		if (unlikely(yyjson_mut_arr_size(params_val) != 6 ||
+		             !version_bits ||
+		             !bip310_parse_mask(version_bits, &version_bits32) ||
+		             !bip310_version_bits_valid(version_bits32, client->version_mask))) {
 			err = SE_INVALID_VERSION_MASK;
 			goto out;
 		}
+	} else if (unlikely(yyjson_mut_arr_size(params_val) != 5)) {
+		/* The sixth field is only valid after successful version-rolling setup. */
+		err = SE_INVALID_VERSION_MASK;
+		goto out;
 	}
 	if (safecmp(workername, client->workername)) {
 		err = SE_WORKER_MISMATCH;
@@ -7761,7 +7876,7 @@ static bool parse_submit(stratum_instance_t *client, yyjson_mut_val *params_val,
 	}
 	if (id < sdata->blockchange_id)
 		stale = true;
-	sdiff = submission_diff(sdata, client, wb, nonce2, ntime32, version_mask32, false,
+	sdiff = submission_diff(sdata, client, wb, nonce2, ntime32, version_bits32, false,
 				nonce, hash, stale);
 	if (sdiff > client->best_diff) {
 		worker_instance_t *worker = client->worker_instance;
@@ -7845,7 +7960,7 @@ out_nowb:
 	 * stale shares and filter out the rest. */
 	if (wb && wb->proxy && submit) {
 		LOGINFO("Submitting share upstream: %s", hexhash);
-		submit_share(client, id, nonce2, ntime, nonce, version_mask32);
+		submit_share(client, id, nonce2, ntime, nonce, version_bits32);
 	}
 
 	add_submit(client, diff, result, submit);
@@ -8341,22 +8456,113 @@ static void parse_method(sdata_t *sdata, stratum_instance_t *client,
 
         if (cmdmatch(method, "mining.configure")) {
 		yyjson_mut_doc *doc;
-		yyjson_mut_val *root;
-
-		char version_str[12];
+		yyjson_mut_val *root, *result, *extensions = NULL, *extparams = NULL;
+		yyjson_mut_val *mask_val, *min_bits_val, *id_copy;
+		uint32_t miner_mask = BIP310_FULL_MASK, effective_mask;
+		unsigned int min_bits = 0;
+		char version_str[9];
+		bool requested = false, config_error = false;
+		size_t i, count = 0;
 
 		LOGINFO("Mining configure requested from %s %s", client->identity,
 			client->address);
-		sprintf(version_str, "%08x", ckpool.version_mask);
 
 		doc = yyjson_mut_doc_new(&ckyyalc);
-		root = yyjson_mut_pack_val(doc, "{s{sbss}sosn}",
-			"result",
-			"version-rolling", true,
-			"version-rolling.mask", version_str,
-			"id", id_val,
-			"error");
+		if (unlikely(!doc))
+			quit(1, "Failed to allocate mining.configure response");
+		root = yyjson_mut_obj(doc);
+		result = yyjson_mut_obj(doc);
+		if (unlikely(!root || !result))
+			quit(1, "Failed to allocate mining.configure response values");
 		yyjson_mut_doc_set_root(doc, root);
+		yyjson_mut_obj_add_val(doc, root, "result", result);
+		if (id_val && (id_copy = yyjson_mut_val_mut_copy(doc, id_val)))
+			yyjson_mut_obj_add_val(doc, root, "id", id_copy);
+		else
+			yyjson_mut_obj_add_null(doc, root, "id");
+		yyjson_mut_obj_add_null(doc, root, "error");
+
+		if (yyjson_mut_is_arr(params_val) && yyjson_mut_arr_size(params_val) >= 1) {
+			extensions = yyjson_mut_arr_get(params_val, 0);
+			extparams = yyjson_mut_arr_get(params_val, 1);
+		}
+
+		/* BIP310 requires a result for every requested extension. Unknown
+		 * extensions are explicitly reported as unsupported. */
+		if (yyjson_mut_is_arr(extensions)) {
+			count = yyjson_mut_arr_size(extensions);
+			for (i = 0; i < count; ++i) {
+				const char *extension = yyjson_mut_get_str(yyjson_mut_arr_get(extensions, i));
+
+				if (!extension || !*extension)
+					continue;
+				if (!strcmp(extension, "version-rolling")) {
+					requested = true;
+					continue;
+				}
+				{
+					yyjson_mut_val *key = yyjson_mut_strcpy(doc, extension);
+					yyjson_mut_val *unsupported = yyjson_mut_bool(doc, false);
+
+					if (key && unsupported)
+						yyjson_mut_obj_put(result, key, unsupported);
+				}
+			}
+		}
+
+		if (requested) {
+			if (extparams && !yyjson_mut_is_obj(extparams)) {
+				config_error = true;
+			} else if (extparams) {
+				mask_val = yyjson_mut_obj_get(extparams, "version-rolling.mask");
+				if (mask_val) {
+					const char *mask = yyjson_mut_get_str(mask_val);
+
+					if (!mask || !bip310_parse_mask(mask, &miner_mask))
+						config_error = true;
+				}
+
+				min_bits_val = yyjson_mut_obj_get(extparams,
+							       "version-rolling.min-bit-count");
+				if (min_bits_val) {
+					int requested_bits;
+
+					if (!yyjson_mut_is_int(min_bits_val) ||
+					    (requested_bits = yyjson_mut_get_int(min_bits_val)) < 0) {
+						config_error = true;
+					} else {
+						min_bits = (unsigned int)requested_bits;
+					}
+				} else {
+					/* ESP-Miner currently omits this formally required BIP310
+					 * parameter. Treat omission as zero for compatibility while
+					 * keeping mask semantics strict. */
+					LOGINFO("BIP310 client %s omitted min-bit-count; assuming 0",
+						client->identity);
+				}
+			}
+
+			if (config_error) {
+				yyjson_mut_obj_add_strcpy(doc, result, "version-rolling",
+							   "invalid version-rolling parameters");
+			} else {
+				effective_mask = bip310_negotiate_mask(ckpool.version_mask, miner_mask);
+				client->version_rolling = true;
+				client->version_mask = effective_mask;
+				client->version_min_bit_count = min_bits;
+				bip310_format_mask(version_str, effective_mask);
+				yyjson_mut_obj_add_bool(doc, result, "version-rolling", true);
+				yyjson_mut_obj_add_strcpy(doc, result, "version-rolling.mask",
+							   version_str);
+				LOGNOTICE("BIP310 %s miner_mask=%08x server_mask=%08x effective=%08x min_bits=%u",
+					  client->identity, miner_mask, ckpool.version_mask,
+					  effective_mask, min_bits);
+				if (bip310_popcount(effective_mask) < min_bits)
+					LOGWARNING("BIP310 %s requested %u bits but effective mask %s exposes %u",
+						   client->identity, min_bits, version_str,
+						   bip310_popcount(effective_mask));
+			}
+		}
 
 		stratum_add_yysend(sdata, doc, client_id, SM_CONFIGURE);
 		return;
@@ -8537,7 +8743,7 @@ static user_instance_t *generate_remote_user(const char *workername)
 
 	if (!ckpool.proxy && (new_user || !user->btcaddress)) {
 		/* Is this a btc address based username? */
-		if (generator_checkaddr(username, &user->script, &user->segwit)) {
+		if (payout_address_valid(username, &user->script, &user->segwit)) {
 			user->btcaddress = true;
 			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
 		}
@@ -10574,8 +10780,8 @@ void *stratifier(void *arg)
 		cksleep_ms(10);
 
 	if (!ckpool.proxy) {
-		if (!generator_checkaddr(ckpool.btcaddress, &ckpool.script, &ckpool.segwit)) {
-			LOGEMERG("Fatal: btcaddress invalid according to bitcoind");
+		if (!payout_address_valid(ckpool.btcaddress, &ckpool.script, &ckpool.segwit)) {
+			LOGEMERG("Fatal: payout address invalid according to configured codec/node");
 			goto out;
 		}
 
@@ -10584,16 +10790,16 @@ void *stratifier(void *arg)
 		sdata->txnlen = address_to_txn(sdata->txnbin, ckpool.btcaddress, ckpool.script, ckpool.segwit);
 
 		/* Find a valid donation address if possible */
-		if (generator_checkaddr(ckpool.donaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+		if (payout_address_valid(ckpool.donaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donvalid = true;
 			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
 			LOGNOTICE("BTC donation address valid %s", ckpool.donaddress);
-		} else if (generator_checkaddr(ckpool.tndonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+		} else if (payout_address_valid(ckpool.tndonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donaddress = ckpool.tndonaddress;
 			ckpool.donvalid = true;
 			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
 			LOGNOTICE("BTC testnet donation address valid %s", ckpool.donaddress);
-		} else if (generator_checkaddr(ckpool.rtdonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+		} else if (payout_address_valid(ckpool.rtdonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donaddress = ckpool.rtdonaddress;
 			ckpool.donvalid = true;
 			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);

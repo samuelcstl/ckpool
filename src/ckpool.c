@@ -27,6 +27,7 @@
 
 #include "ckpool.h"
 #include "libckpool.h"
+#include "bip310.h"
 #include "generator.h"
 #include "stratifier.h"
 #include "connector.h"
@@ -1740,10 +1741,14 @@ static void parse_config(void)
 	yyjson_obj_get_int(&ckpool.nonce2length, json_conf, "nonce2length");
 	yyjson_obj_get_int(&ckpool.update_interval, json_conf, "update_interval");
 	yyjson_obj_get_string(&vmask, json_conf, "version_mask");
-	if (vmask && strlen(vmask) && validhex(vmask))
-		sscanf(vmask, "%x", &ckpool.version_mask);
-	else
+	if (vmask && strlen(vmask)) {
+		if (!bip310_parse_mask(vmask, &ckpool.version_mask)) {
+			LOGWARNING("Invalid BIP310 version_mask %s; using 1fffe000", vmask);
+			ckpool.version_mask = 0x1fffe000;
+		}
+	} else {
 		ckpool.version_mask = 0x1fffe000;
+	}
 	dealloc(vmask);
 
 	/* Default don't drop idle clients */

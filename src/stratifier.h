@@ -10,6 +10,15 @@
 #ifndef STRATIFIER_H
 #define STRATIFIER_H
 
+#define MAX_GBT_COINBASE_OUTPUTS 8
+#define MAX_GBT_OUTPUT_SCRIPT_LEN 512
+
+struct gbt_coinbase_output {
+	uint64_t amount;
+	uint16_t script_len;
+	uint8_t script[MAX_GBT_OUTPUT_SCRIPT_LEN];
+};
+
 /* Generic structure for both workbase in stratifier and gbtbase in generator */
 struct genwork {
 	/* Hash table data */
@@ -45,6 +54,11 @@ struct genwork {
 	char bbversion[12];
 	char nbit[12];
 	uint64_t coinbasevalue;
+	/* Optional consensus outputs sourced from GBT and an optional effective
+	 * difficulty distinct from the header nBits target. */
+	int mandatory_outputs;
+	struct gbt_coinbase_output mandatory_output[MAX_GBT_COINBASE_OUTPUTS];
+	double effective_diff; /* zero means derive from header nBits */
 	int height;
 	char *flags;
 	int txns;
