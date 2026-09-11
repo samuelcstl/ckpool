@@ -14,6 +14,7 @@
 #include "ckpool.h"
 #include "libckpool.h"
 #include "bitcoin.h"
+#include "multichain.h"
 #include "stratifier.h"
 #include "yyjson.h"
 
@@ -301,6 +302,10 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	res_val = yyjson_obj_get(root, "result");
 	if (!res_val) {
 		LOGWARNING("Failed to get result in json response to getblocktemplate");
+		goto out;
+	}
+	if (unlikely(!multichain_config_valid())) {
+		LOGERR("Invalid multichain capability configuration");
 		goto out;
 	}
 

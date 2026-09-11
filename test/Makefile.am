@@ -1,12 +1,14 @@
 AM_CPPFLAGS = -I$(top_srcdir)/src -I$(top_builddir)
 LDADD = $(top_srcdir)/src/libckpool.a
 
-check_PROGRAMS = sha256 bip310 cashaddr
-TESTS = sha256 bip310 cashaddr
+check_PROGRAMS = sha256 bip310 cashaddr chaincaps
+TESTS = sha256 bip310 cashaddr chaincaps
 
 sha256_SOURCES = sha256.c
 bip310_SOURCES = bip310.c
 cashaddr_SOURCES = cashaddr.c
+chaincaps_SOURCES = chaincaps_test.c $(top_srcdir)/src/multichain.c $(top_srcdir)/src/yyjson.c
+chaincaps_LDADD = $(top_srcdir)/src/libckpool.a
 
 if HAVE_SV2
 AM_CPPFLAGS += @SV2_CFLAGS@
