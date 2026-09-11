@@ -22,6 +22,7 @@ bool validate_address(connsock_t *cs, const char *address, bool *script, bool *s
 int payout_address_to_txn(char *p2h, const char *addr, const bool script,
                           const bool segwit);
 bool payout_address_is_cashaddr(const char *addr, bool *script, bool *segwit);
+bool payout_local_codec_enabled(void);
 yyjson_doc *validate_txn(connsock_t *cs, const char *txn);
 bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt);
 void clear_gbtbase(gbtbase_t *gbt);

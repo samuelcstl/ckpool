@@ -51,9 +51,11 @@ static int profile_default(void)
     memset(&ckpool, 0, sizeof(ckpool));
     if (!multichain_config_valid())
         return 1;
+    if (payout_local_codec_enabled())
+        return 2;
     if (multichain_coinbase_txntime() || !multichain_validate_coinbase() ||
         !multichain_preciousblock() || multichain_block_suffix())
-        return 2;
+        return 3;
     return 0;
 }
 
@@ -95,6 +97,8 @@ static int profile_bch(void)
     ckpool.config = path;
     if (!multichain_config_valid())
         rc = 2;
+    else if (!payout_local_codec_enabled())
+        rc = 3;
     else if (!payout_address_is_cashaddr(addr, &is_script, &segwit) || is_script || segwit)
         rc = 3;
     else if (!payout_address_is_cashaddr(prefixless, &is_script, &segwit) || is_script || segwit)

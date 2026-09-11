@@ -6274,9 +6274,23 @@ static worker_instance_t *get_worker(sdata_t *sdata, user_instance_t *user, cons
  * valid. Everything else stays on the upstream daemon-validation path. */
 static bool payout_address_valid(const char *address, bool *script, bool *segwit)
 {
+	char txnbin[256];
+
 	if (payout_address_is_cashaddr(address, script, segwit))
 		return true;
-	return generator_checkaddr(address, script, segwit);
+	if (!generator_checkaddr(address, script, segwit))
+		return false;
+	/* With an opt-in local payout codec, do not admit a newer daemon-
+	 * accepted address form unless the exact serializer we will use for
+	 * coinbase construction can encode it too. Default Bitcoin behavior
+	 * remains unchanged when no local codec is configured. */
+	if (payout_local_codec_enabled() &&
+	    payout_address_to_txn(txnbin, address, *script, *segwit) <= 0) {
+		LOGWARNING("Node accepted payout address unsupported by configured codec: %s",
+			   address);
+		return false;
+	}
+	return true;
 }
 
 /* This simply strips off the first part of the workername and matches it to a

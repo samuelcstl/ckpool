@@ -15,7 +15,7 @@ The multichain work is grounded in pool implementations already deployed in the 
 | BCH | `skaisser/ckpool` | `0479f860` | no meaningful local edits | port the BCH fork's protocol requirements as generic capabilities where possible |
 | XEC | `Bitcoin-ABC/ecash-ckpool-solo` | `10bcb1ca` | no meaningful local edits | port mandatory eCash coinbase/RTT/address behavior without changing BTC defaults |
 | PPC | qualified keyless PPC ckpool lineage retained in this repository | qualification tip `9bfb38a9` | qualified source delta | port transaction/block serialization differences as explicit capabilities |
-| LCC | not yet deployed | n/a | n/a | first new lane; SHA256d GBT selection is the immediate requirement |
+| LCC | unified multichain fork | `6ff395fb` live baseline | none | SHA256d GBT path is live-proven, including main-chain block 4507116 |
 
 The unified branch is based on current upstream source, while the previously qualified PPC lineage remains in Git ancestry and its qualification documents remain in-tree.
 
@@ -70,13 +70,13 @@ The deployed BCH fork requests a template without the SegWit `rules` member and 
 }
 ```
 
-CashAddr P2PKH/P2SH admission and script construction are local and prefix-driven, including valid prefixless CashAddr payloads. When an address does not match the configured CashAddr prefix, validation and Base58/SegWit construction fall back to the upstream daemon path. This keeps default Bitcoin behavior unchanged while removing a daemon-format dependency from BCH/XEC configured and username-derived payouts.
+CashAddr P2PKH/P2SH admission and script construction are local and prefix-driven, including valid prefixless CashAddr payloads. When an address does not match the configured CashAddr prefix, validation and Base58/SegWit construction fall back to the upstream daemon path. While a local codec is configured, a daemon-accepted fallback address is admitted only if the payout serializer can encode it, preventing newer unsupported address forms from producing an unusable coinbase output. Default Bitcoin behavior remains unchanged when no local codec is configured.
 
 `gbtparams` and `gbtargs` preserve JSON value types, so future chains may provide booleans, numbers, strings, arrays, objects, or null values without adding chain-specific code. `gbtdrop` entries must be strings.
 
-## Capability inventory before fleet qualification
+## Capability inventory
 
-The fork is not considered fleet-ready until every consensus- or payout-relevant delta from the proven implementations is represented and tested.
+All currently known consensus- and payout-relevant deltas from the proven implementations are represented behind generic capabilities. Fleet readiness remains gated on the consolidated ARM64 and live-node acceptance pass.
 
 | Capability | BTC/DGB/AUR/BFX | LCC | PPC | BCH | XEC |
 | --- | --- | --- | --- | --- | --- |
@@ -90,7 +90,7 @@ The fork is not considered fleet-ready until every consensus- or payout-relevant
 | mandatory GBT-defined coinbase outputs | no | no | no | no | miner fund + staking rewards |
 | alternate next-block target from GBT | no | no | no | no | RTT target |
 | suppress post-submit `preciousblock` | no | no | no | no | required for Avalanche compatibility |
-| strict negotiated SV1 version mask | hardening target | important (`0000e000`) | important | useful | useful |
+| strict negotiated SV1 version mask | implemented | implemented; LCC live-proven at `0000e000` | implemented; PPC qualified at `1fffe000` | implemented | implemented |
 
 The implementation is now decomposed into four generic layers:
 

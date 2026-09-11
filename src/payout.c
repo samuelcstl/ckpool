@@ -78,6 +78,12 @@ out:
 	yyjson_doc_free(doc);
 }
 
+bool payout_local_codec_enabled(void)
+{
+	pthread_once(&cashaddr_prefix_once, load_cashaddr_prefix);
+	return cashaddr_prefix_configured && cashaddr_prefix_valid;
+}
+
 bool payout_address_is_cashaddr(const char *addr, bool *script, bool *segwit)
 {
 	uint8_t hash160[20];
