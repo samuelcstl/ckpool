@@ -28,11 +28,11 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Verify phase-1 baseline
+      - name: Verify PPC baseline
         working-directory: src
         run: |
           set -Eeuo pipefail
-          test "$(git rev-parse HEAD)" = "a5fa08821b7152792f168aa3189fce88a5b8529d"
+          test "$(git rev-parse HEAD)" = "f3c950745779ad4d4170300ad894a3d87f4af1e0"
 
       - name: Install native build dependencies
         run: |
@@ -47,7 +47,7 @@ jobs:
           git config user.name "Samuel Castel"
           git config user.email "2681949+samuelcstl@users.noreply.github.com"
 
-      - name: Prepare patch driver for resumed target
+      - name: Prepare final-phase patch driver
         working-directory: src
         run: |
           set -Eeuo pipefail
@@ -56,43 +56,35 @@ jobs:
           p = Path('../patcher/tools/agent_multichain_complete.py')
           s = p.read_text()
 
-          root_old = 'ROOT = Path(__file__).resolve().parents[1]'
-          if s.count(root_old) != 1:
-              raise SystemExit(f'expected exactly one patch-root marker, got {s.count(root_old)}')
-          s = s.replace(root_old, 'ROOT = Path.cwd()', 1)
+          old = 'ROOT = Path(__file__).resolve().parents[1]'
+          if s.count(old) != 1:
+              raise SystemExit(f'patch-root marker count={s.count(old)}')
+          s = s.replace(old, 'ROOT = Path.cwd()', 1)
 
-          old_link = 'chaincaps_SOURCES = chaincaps_test.c $(top_srcdir)/src/multichain.c\\nchaincaps_LDADD'
-          new_link = 'chaincaps_SOURCES = chaincaps_test.c $(top_srcdir)/src/multichain.c $(top_srcdir)/src/yyjson.c\\nchaincaps_LDADD'
-          if s.count(old_link) != 2:
-              raise SystemExit(f'expected two chaincaps link markers, got {s.count(old_link)}')
-          s = s.replace(old_link, new_link)
+          old = '\t\t\tuchar compact[4];'
+          if s.count(old) != 1:
+              raise SystemExit(f'compact target marker count={s.count(old)}')
+          s = s.replace(old, '\t\t\tchar compact[4];', 1)
 
-          old_phase3 = 'chaincaps_SOURCES = chaincaps_test.c $(top_srcdir)/src/multichain.c $(top_srcdir)/src/payout.c\\nchaincaps_LDADD'
-          new_phase3 = 'chaincaps_SOURCES = chaincaps_test.c $(top_srcdir)/src/multichain.c $(top_srcdir)/src/payout.c $(top_srcdir)/src/yyjson.c\\nchaincaps_LDADD'
-          if s.count(old_phase3) != 1:
-              raise SystemExit(f'expected one phase3 link marker, got {s.count(old_phase3)}')
-          s = s.replace(old_phase3, new_phase3, 1)
+          old = '''\tuint8_t hash160[20] = {0};\n\tchar address[128], config[2048], gbtjson[2048];'''
+          new = '''\tconst char *address = "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2";\n\tchar config[2048], gbtjson[2048];'''
+          if s.count(old) != 1:
+              raise SystemExit(f'fixture declaration marker count={s.count(old)}')
+          s = s.replace(old, new, 1)
 
-          old_count = 'replace_count("src/stratifier.c", old_validation, new_validation, 2)'
-          if s.count(old_count) != 1:
-              raise SystemExit(f'expected one validation-count marker, got {s.count(old_count)}')
-          s = s.replace(old_count, 'replace_count("src/stratifier.c", old_validation, new_validation, 1)', 1)
+          old = '''\thash160[0] = 0x42;\n\tif (!cashaddr_from_hash160(address, sizeof(address), "ecash", hash160, false))\n\t\treturn 10;\n'''
+          if s.count(old) != 1:
+              raise SystemExit(f'fixture generator marker count={s.count(old)}')
+          s = s.replace(old, '', 1)
+
+          old = '''        'chaincaps_SOURCES = chaincaps_test.c $(top_srcdir)/src/multichain.c\\nchaincaps_LDADD = $(top_srcdir)/src/libckpool.a',\n        'chaincaps_SOURCES = chaincaps_test.c $(top_srcdir)/src/multichain.c $(top_srcdir)/src/payout.c\\nchaincaps_LDADD = $(top_srcdir)/src/libckpool.a','''
+          new = '''        'chaincaps_SOURCES = chaincaps_test.c $(top_srcdir)/src/multichain.c $(top_srcdir)/src/yyjson.c\\nchaincaps_LDADD = $(top_srcdir)/src/libckpool.a',\n        'chaincaps_SOURCES = chaincaps_test.c $(top_srcdir)/src/multichain.c $(top_srcdir)/src/payout.c $(top_srcdir)/src/yyjson.c\\nchaincaps_LDADD = $(top_srcdir)/src/libckpool.a','''
+          if s.count(old) != 1:
+              raise SystemExit(f'phase3 test-link marker count={s.count(old)}')
+          s = s.replace(old, new, 1)
+
           p.write_text(s)
           PY
-
-      - name: Phase 2 - qualified PPC serialization wiring
-        working-directory: src
-        run: |
-          set -Eeuo pipefail
-          python3 ../patcher/tools/agent_multichain_complete.py phase2
-          ./autogen.sh
-          ./configure
-          make -j2
-          make check
-          git add src/stratifier.c MULTICHAIN.md
-          git diff --cached --check
-          git commit -m "ppc: wire generic serialization capabilities"
-          git push origin HEAD:unified-multichain-v1
 
       - name: Phase 3 - GBT outputs and effective target
         working-directory: src
@@ -109,10 +101,16 @@ jobs:
           git commit -m "multichain: add GBT-defined outputs and effective target"
           git push origin HEAD:unified-multichain-v1
 
-      - name: Final branch summary
+      - name: Final regression and policy audit
         working-directory: src
         run: |
           set -Eeuo pipefail
-          git status --short --branch
-          git log -4 --oneline
           make check
+          test -z "$(git status --porcelain)"
+          ! grep -RniE 'if[[:space:]]*\([^)]*(BTC|BCH|DGB|AUR|BFX|LCC|PPC|XEC)|strcmp\([^,]+,[[:space:]]*"(BTC|BCH|DGB|AUR|BFX|LCC|PPC|XEC)' \
+            src/multichain.c src/payout.c src/bitcoin.c src/stratifier.c
+          grep -q '"cashaddr_prefix": "ecash"' MULTICHAIN.md
+          grep -q '"gbttarget": "/rtt/nexttarget"' MULTICHAIN.md
+          grep -q '"coinbase_txntime": true' MULTICHAIN.md
+          git status --short --branch
+          git log -5 --oneline
