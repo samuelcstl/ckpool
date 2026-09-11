@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 jobs:
-  cashaddr-admission:
+  final-hardening:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     steps:
@@ -18,8 +18,8 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Verify hardened baseline
-        run: test "$(git rev-parse HEAD)" = "3cb83f434016fa07500df1b25a1b290813606bb1"
+      - name: Verify CashAddr-admission baseline
+        run: test "$(git rev-parse HEAD)" = "607894d0dc21e0f67a983d3f7dd7bb5f0533d6eb"
 
       - name: Install build dependencies
         run: |
@@ -31,7 +31,7 @@ jobs:
           git config user.name "Samuel Castel"
           git config user.email "2681949+samuelcstl@users.noreply.github.com"
 
-      - name: Wire generic local CashAddr admission
+      - name: Enforce payout constructibility under local codec
         run: |
           set -Eeuo pipefail
           python3 - <<'PY'
@@ -39,153 +39,122 @@ jobs:
 
           p = Path('src/bitcoin.h')
           s = p.read_text()
-          old = 'int payout_address_to_txn(char *p2h, const char *addr, const bool script,\n                          const bool segwit);'
-          new = old + '\nbool payout_address_is_cashaddr(const char *addr, bool *script, bool *segwit);'
+          old = 'bool payout_address_is_cashaddr(const char *addr, bool *script, bool *segwit);'
+          new = old + '\nbool payout_local_codec_enabled(void);'
           assert s.count(old) == 1, s.count(old)
           p.write_text(s.replace(old, new, 1))
 
           p = Path('src/payout.c')
           s = p.read_text()
-          marker = 'int payout_address_to_txn(char *p2h, const char *addr, const bool script,\n                          const bool segwit)\n{'
-          helper = '''bool payout_address_is_cashaddr(const char *addr, bool *script, bool *segwit)
+          marker = '''bool payout_address_is_cashaddr(const char *addr, bool *script, bool *segwit)
+          {'''
+          helper = '''bool payout_local_codec_enabled(void)
           {
-          \tuint8_t hash160[20];
-          \tbool is_p2sh;
-
           \tpthread_once(&cashaddr_prefix_once, load_cashaddr_prefix);
-          \tif (!cashaddr_prefix_configured || unlikely(!cashaddr_prefix_valid))
-          \t\treturn false;
-          \tif (!cashaddr_decode(addr, cashaddr_prefix, hash160, &is_p2sh))
-          \t\treturn false;
-          \tif (script)
-          \t\t*script = is_p2sh;
-          \tif (segwit)
-          \t\t*segwit = false;
-          \treturn true;
+          \treturn cashaddr_prefix_configured && cashaddr_prefix_valid;
           }
 
-          int payout_address_to_txn(char *p2h, const char *addr, const bool script,
-                                    const bool segwit)
+          bool payout_address_is_cashaddr(const char *addr, bool *script, bool *segwit)
           {'''
           assert s.count(marker) == 1, s.count(marker)
           p.write_text(s.replace(marker, helper, 1))
 
           p = Path('src/stratifier.c')
           s = p.read_text()
-          marker = '/* This simply strips off the first part of the workername and matches it to a\n * user or creates a new one. Needs to be entered with client holding a ref\n * count. */'
-          helper = '''/* Prefer the configured local payout codec when it can prove an address is
-           * valid. Everything else stays on the upstream daemon-validation path. */
-          static bool payout_address_valid(const char *address, bool *script, bool *segwit)
+          old = '''static bool payout_address_valid(const char *address, bool *script, bool *segwit)
           {
           \tif (payout_address_is_cashaddr(address, script, segwit))
           \t\treturn true;
           \treturn generator_checkaddr(address, script, segwit);
-          }
+          }'''
+          new = '''static bool payout_address_valid(const char *address, bool *script, bool *segwit)
+          {
+          \tchar txnbin[256];
 
-          /* This simply strips off the first part of the workername and matches it to a
-           * user or creates a new one. Needs to be entered with client holding a ref
-           * count. */'''
-          assert s.count(marker) == 1, s.count(marker)
-          s = s.replace(marker, helper, 1)
-
-          old = 'if (generator_checkaddr(username, &user->script, &user->segwit)) {'
-          new = 'if (payout_address_valid(username, &user->script, &user->segwit)) {'
-          assert s.count(old) == 2, s.count(old)
-          s = s.replace(old, new)
-
-          replacements = [
-              ('if (!generator_checkaddr(ckpool.btcaddress, &ckpool.script, &ckpool.segwit)) {',
-               'if (!payout_address_valid(ckpool.btcaddress, &ckpool.script, &ckpool.segwit)) {'),
-              ('if (generator_checkaddr(ckpool.donaddress, &ckpool.donscript, &ckpool.donsegwit)) {',
-               'if (payout_address_valid(ckpool.donaddress, &ckpool.donscript, &ckpool.donsegwit)) {'),
-              ('} else if (generator_checkaddr(ckpool.tndonaddress, &ckpool.donscript, &ckpool.donsegwit)) {',
-               '} else if (payout_address_valid(ckpool.tndonaddress, &ckpool.donscript, &ckpool.donsegwit)) {'),
-              ('} else if (generator_checkaddr(ckpool.rtdonaddress, &ckpool.donscript, &ckpool.donsegwit)) {',
-               '} else if (payout_address_valid(ckpool.rtdonaddress, &ckpool.donscript, &ckpool.donsegwit)) {'),
-              ('LOGEMERG("Fatal: btcaddress invalid according to bitcoind");',
-               'LOGEMERG("Fatal: payout address invalid according to configured codec/node");'),
-          ]
-          for old, new in replacements:
-              assert s.count(old) == 1, (old, s.count(old))
-              s = s.replace(old, new, 1)
-          p.write_text(s)
+          \tif (payout_address_is_cashaddr(address, script, segwit))
+          \t\treturn true;
+          \tif (!generator_checkaddr(address, script, segwit))
+          \t\treturn false;
+          \t/* With an opt-in local payout codec, do not admit a newer daemon-
+          \t * accepted address form unless the exact serializer we will use for
+          \t * coinbase construction can encode it too. Default Bitcoin behavior
+          \t * remains unchanged when no local codec is configured. */
+          \tif (payout_local_codec_enabled() &&
+          \t    payout_address_to_txn(txnbin, address, *script, *segwit) <= 0) {
+          \t\tLOGWARNING("Node accepted payout address unsupported by configured codec: %s",
+          \t\t\t   address);
+          \t\treturn false;
+          \t}
+          \treturn true;
+          }'''
+          assert s.count(old) == 1, s.count(old)
+          p.write_text(s.replace(old, new, 1))
           PY
 
-      - name: Extend admission regressions and docs
+      - name: Extend profile invariants
         run: |
           set -Eeuo pipefail
           python3 - <<'PY'
           from pathlib import Path
-
           p = Path('test/chain_profiles.c')
           s = p.read_text()
-          old = '''    static const char *addr = "bitcoincash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a";
-              char script[64];
-              char *path = write_config("{\\"cashaddr_prefix\\":\\"bitcoincash\\",\\"gbtdrop\\":[\\"rules\\"]}\\n");
-              int len, rc = 0;'''
-          new = '''    static const char *addr = "bitcoincash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a";
-              static const char *prefixless = "qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a";
-              static const char *p2sh = "bitcoincash:ppm2qsznhks23z7629mms6s4cwef74vcwvn0h829pq";
-              char script[64];
-              bool is_script = false, segwit = true;
-              char *path = write_config("{\\"cashaddr_prefix\\":\\"bitcoincash\\",\\"gbtdrop\\":[\\"rules\\"]}\\n");
-              int len, rc = 0;'''
+          old = '''    if (!multichain_config_valid())
+                  return 1;
+              if (multichain_coinbase_txntime() || !multichain_validate_coinbase() ||
+                  !multichain_preciousblock() || multichain_block_suffix())
+                  return 2;'''
+          new = '''    if (!multichain_config_valid())
+                  return 1;
+              if (payout_local_codec_enabled())
+                  return 2;
+              if (multichain_coinbase_txntime() || !multichain_validate_coinbase() ||
+                  !multichain_preciousblock() || multichain_block_suffix())
+                  return 3;'''
           assert s.count(old) == 1, s.count(old)
           s = s.replace(old, new, 1)
 
           old = '''    if (!multichain_config_valid())
                   rc = 2;
-              else if ((len = payout_address_to_txn(script, addr, false, false)) != 25)
-                  rc = 3;
-              else if ((unsigned char)script[0] != 0x76 || (unsigned char)script[1] != 0xa9 ||
-                       (unsigned char)script[2] != 0x14 || (unsigned char)script[23] != 0x88 ||
-                       (unsigned char)script[24] != 0xac)
-                  rc = 4;'''
+              else if (!payout_address_is_cashaddr(addr, &is_script, &segwit) || is_script || segwit)'''
           new = '''    if (!multichain_config_valid())
                   rc = 2;
-              else if (!payout_address_is_cashaddr(addr, &is_script, &segwit) || is_script || segwit)
+              else if (!payout_local_codec_enabled())
                   rc = 3;
-              else if (!payout_address_is_cashaddr(prefixless, &is_script, &segwit) || is_script || segwit)
-                  rc = 4;
-              else if (!payout_address_is_cashaddr(p2sh, &is_script, &segwit) || !is_script || segwit)
-                  rc = 5;
-              else if (payout_address_is_cashaddr("ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2",
-                                                  &is_script, &segwit))
-                  rc = 6;
-              else if ((len = payout_address_to_txn(script, addr, false, false)) != 25)
-                  rc = 7;
-              else if ((unsigned char)script[0] != 0x76 || (unsigned char)script[1] != 0xa9 ||
-                       (unsigned char)script[2] != 0x14 || (unsigned char)script[23] != 0x88 ||
-                       (unsigned char)script[24] != 0xac)
-                  rc = 8;'''
+              else if (!payout_address_is_cashaddr(addr, &is_script, &segwit) || is_script || segwit)'''
+          assert s.count(old) == 1, s.count(old)
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+          PY
+
+      - name: Finish public compatibility documentation
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('MULTICHAIN.md')
+          s = p.read_text()
+          old = '| LCC | not yet deployed | n/a | n/a | first new lane; SHA256d GBT selection is the immediate requirement |'
+          new = '| LCC | unified multichain fork | `6ff395fb` live baseline | none | SHA256d GBT path is live-proven, including main-chain block 4507116 |'
           assert s.count(old) == 1, s.count(old)
           s = s.replace(old, new, 1)
 
-          old = '''    if (multichain_coinbase_txntime() || !multichain_validate_coinbase() ||
-                  multichain_preciousblock() || multichain_block_suffix()) {
-                  rc = 3;
-                  goto out;
-              }'''
-          new = old + '''
-              {
-                  bool is_script = true, segwit = true;
-                  if (!payout_address_is_cashaddr(addr, &is_script, &segwit) || is_script || segwit) {
-                      rc = 8;
-                      goto out;
-                  }
-              }'''
+          old = '## Capability inventory before fleet qualification\n\nThe fork is not considered fleet-ready until every consensus- or payout-relevant delta from the proven implementations is represented and tested.'
+          new = '## Capability inventory\n\nAll currently known consensus- and payout-relevant deltas from the proven implementations are represented behind generic capabilities. Fleet readiness remains gated on the consolidated ARM64 and live-node acceptance pass.'
           assert s.count(old) == 1, s.count(old)
-          p.write_text(s.replace(old, new, 1))
+          s = s.replace(old, new, 1)
 
-          p = Path('MULTICHAIN.md')
-          s = p.read_text()
-          old = 'CashAddr P2PKH/P2SH script construction is local and prefix-driven. Legacy Base58 and SegWit script construction remains on the upstream path when CashAddr does not match. Daemon `validateaddress` remains authoritative for configured and username-derived payout acceptance; the final live BCH qualification therefore checks those entry paths as well as script construction.'
-          new = 'CashAddr P2PKH/P2SH admission and script construction are local and prefix-driven, including valid prefixless CashAddr payloads. When an address does not match the configured CashAddr prefix, validation and Base58/SegWit construction fall back to the upstream daemon path. This keeps default Bitcoin behavior unchanged while removing a daemon-format dependency from BCH/XEC configured and username-derived payouts.'
+          old = '| strict negotiated SV1 version mask | hardening target | important (`0000e000`) | important | useful | useful |'
+          new = '| strict negotiated SV1 version mask | implemented | implemented; LCC live-proven at `0000e000` | implemented; PPC qualified at `1fffe000` | implemented | implemented |'
+          assert s.count(old) == 1, s.count(old)
+          s = s.replace(old, new, 1)
+
+          old = 'When an address does not match the configured CashAddr prefix, validation and Base58/SegWit construction fall back to the upstream daemon path. This keeps default Bitcoin behavior unchanged while removing a daemon-format dependency from BCH/XEC configured and username-derived payouts.'
+          new = 'When an address does not match the configured CashAddr prefix, validation and Base58/SegWit construction fall back to the upstream daemon path. While a local codec is configured, a daemon-accepted fallback address is admitted only if the payout serializer can encode it, preventing newer unsupported address forms from producing an unusable coinbase output. Default Bitcoin behavior remains unchanged when no local codec is configured.'
           assert s.count(old) == 1, s.count(old)
           p.write_text(s.replace(old, new, 1))
           PY
 
-      - name: Native hosted build and regression suite
+      - name: Native hosted build and complete regression suite
         run: |
           set -Eeuo pipefail
           ./autogen.sh
@@ -193,21 +162,21 @@ jobs:
           make -j2
           make check
 
-      - name: Focused source audit
+      - name: Final source policy audit
         run: |
           set -Eeuo pipefail
           git diff --check
-          grep -q 'payout_address_is_cashaddr' src/payout.c
-          test "$(grep -c 'payout_address_valid(username' src/stratifier.c)" -eq 2
-          grep -q 'payout_address_valid(ckpool.btcaddress' src/stratifier.c
-          grep -q 'prefixless' test/chain_profiles.c
+          grep -q 'payout_local_codec_enabled' src/payout.c
+          grep -q 'unsupported by configured codec' src/stratifier.c
+          grep -q 'main-chain block 4507116' MULTICHAIN.md
+          grep -q 'LCC live-proven at `0000e000`' MULTICHAIN.md
           ! grep -nE 'if[[:space:]]*\([^)]*(BCH|XEC|PPC|LCC|DGB|AUR|BFX)' src/payout.c src/multichain.c src/bitcoin.c src/stratifier.c
 
-      - name: Commit tested admission support
+      - name: Commit final tested source hardening
         run: |
           set -Eeuo pipefail
           git add src/bitcoin.h src/payout.c src/stratifier.c test/chain_profiles.c MULTICHAIN.md
           git diff --cached --check
-          git commit -m "cashaddr: admit configured-prefix payout addresses locally"
+          git commit -m "multichain: require constructible payout addresses"
           git push origin HEAD:unified-multichain-v1
-          git log -5 --oneline
+          git log -6 --oneline
