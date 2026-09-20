@@ -51,14 +51,12 @@ int main(void)
 	assert(plan.miner_value == 475000000);
 	assert(plan.outputs[0].value == 200000000);
 	assert(plan.outputs[0].script_len == 25);
-	{
-		static const unsigned char gold_script[25] = {
+	static const unsigned char gold_script[25] = {
 			0x76, 0xa9, 0x14, 0xfd, 0x30, 0x3c, 0xb4, 0xd2, 0x6c,
 			0x82, 0x1b, 0xaf, 0xcd, 0x73, 0xa3, 0x2d, 0x63, 0xa5,
 			0x71, 0xb2, 0x40, 0x52, 0xdf, 0x88, 0xac
-		};
-		assert(!memcmp(plan.outputs[0].script, gold_script, sizeof(gold_script)));
-	}
+	};
+	assert(!memcmp(plan.outputs[0].script, gold_script, sizeof(gold_script)));
 	len = coinbase_extension_serialize_output(out, sizeof(out), &plan.outputs[0]);
 	assert(len == 34);
 	assert(out[0] == 0x00 && out[1] == 0xc2 && out[2] == 0xeb && out[3] == 0x0b);
