@@ -1,10 +1,14 @@
 AM_CPPFLAGS = -I$(top_srcdir)/src -I$(top_builddir)
 LDADD = $(top_srcdir)/src/libckpool.a
 
-check_PROGRAMS = sha256
-TESTS = sha256
+check_PROGRAMS = sha256 coinbase_extension
+TESTS = sha256 coinbase_extension
 
 sha256_SOURCES = sha256.c
+
+coinbase_extension_SOURCES = coinbase_extension.c \
+	$(top_srcdir)/src/coinbase_extension.c \
+	$(top_srcdir)/src/yyjson.c
 
 if HAVE_SV2
 AM_CPPFLAGS += @SV2_CFLAGS@
