@@ -37,6 +37,7 @@
 #include "utlist.h"
 #include "connector.h"
 #include "generator.h"
+#include "coinbase_extension.h"
 #ifdef HAVE_SV2
 #include "sv2_strat.h"
 #include "sv2_jd.h"
@@ -590,8 +591,10 @@ static int ser_bip34_height(uint8_t *buf, uint32_t height)
 
 static void generate_coinbase(workbase_t *wb)
 {
+	coinbase_extension_plan_t extension_plan = {};
 	uint64_t u64, g64, d64 = 0;
 	uint32_t u32;
+	size_t extension_outputs = 0;
 	sdata_t *sdata = ckpool.sdata;
 	char header[272];
 	int len, ofs = 0;
@@ -671,16 +674,27 @@ static void generate_coinbase(workbase_t *wb)
 	memcpy(wb->coinb2bin + wb->coinb2len, "\xff\xff\xff\xfe", 4);
 	wb->coinb2len += 4;
 
-	// Generation value
+	/* Start with the full template value. An explicitly configured extension
+	 * may reserve part of it for consensus-mandated outputs. */
 	g64 = wb->coinbasevalue;
+	if (ckpool.coinbaseextension) {
+		if (!coinbase_extension_plan(ckpool.coinbaseextension, wb->gbtroot,
+					     wb->coinbasevalue, &extension_plan)) {
+			LOGEMERG("Invalid %s coinbase extension metadata; refusing to build unsafe work",
+				 ckpool.coinbaseextension);
+			exit(1);
+		}
+		g64 = extension_plan.miner_value;
+		extension_outputs = extension_plan.output_count;
+	}
 	if (ckpool.donvalid && ckpool.donation > 0) {
 		double dbl64 = (double)g64 / 100 * ckpool.donation;
 
 		d64 = dbl64;
 		g64 -= d64; // To guarantee integers add up to the original coinbasevalue
-		wb->coinb2bin[wb->coinb2len++] = 2 + wb->insert_witness;
+		wb->coinb2bin[wb->coinb2len++] = 2 + extension_outputs + wb->insert_witness;
 	} else
-		wb->coinb2bin[wb->coinb2len++] = 1 + wb->insert_witness;
+		wb->coinb2bin[wb->coinb2len++] = 1 + extension_outputs + wb->insert_witness;
 
 	u64 = htole64(g64);
 	memcpy(&wb->coinb2bin[wb->coinb2len], &u64, sizeof(uint64_t));
@@ -689,7 +703,9 @@ static void generate_coinbase(workbase_t *wb)
 	/* Coinb2 address goes here, takes up 23~25 bytes + 1 byte for length */
 
 	wb->coinb3len = 0;
-	wb->coinb3bin = ckzalloc(256 + wb->insert_witness * (8 + witnessdata_size + 2));
+	wb->coinb3bin = ckzalloc(256 +
+		COINBASE_EXTENSION_MAX_OUTPUTS * (9 + COINBASE_EXTENSION_MAX_SCRIPT_BYTES) +
+		wb->insert_witness * (8 + witnessdata_size + 2));
 
 	if (ckpool.donvalid && ckpool.donation > 0) {
 		u64 = htole64(d64);
@@ -701,6 +717,20 @@ static void generate_coinbase(workbase_t *wb)
 		wb->coinb3len += sdata->dontxnlen;
 	} else
 		ckpool.donation = 0;
+
+	for (size_t i = 0; i < extension_outputs; i++) {
+		size_t output_len = coinbase_extension_serialize_output(
+			wb->coinb3bin + wb->coinb3len,
+			256 + COINBASE_EXTENSION_MAX_OUTPUTS *
+				(9 + COINBASE_EXTENSION_MAX_SCRIPT_BYTES) - wb->coinb3len,
+			&extension_plan.outputs[i]);
+		if (!output_len) {
+			LOGEMERG("Unable to serialize %s coinbase extension output",
+				 ckpool.coinbaseextension);
+			exit(1);
+		}
+		wb->coinb3len += output_len;
+	}
 
 	if (wb->insert_witness) {
 		// 0 value
