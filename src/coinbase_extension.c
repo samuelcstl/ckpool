@@ -42,7 +42,7 @@ static bool plan_fivetrat_delayed_jackpot(yyjson_val *gbt,
 
 	plan->miner_value = coinbase_value;
 	if (!bonus)
-		return script[0] == '\0';
+		return true;
 
 	hex_len = strlen(script);
 	if (!hex_len || (hex_len & 1) || hex_len > FIVETRAT_MAX_SCRIPT_BYTES * 2)
