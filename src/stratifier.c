@@ -720,7 +720,7 @@ static void generate_coinbase(workbase_t *wb)
 
 	for (size_t i = 0; i < extension_outputs; i++) {
 		size_t output_len = coinbase_extension_serialize_output(
-			wb->coinb3bin + wb->coinb3len,
+			(unsigned char *)wb->coinb3bin + wb->coinb3len,
 			256 + COINBASE_EXTENSION_MAX_OUTPUTS *
 				(9 + COINBASE_EXTENSION_MAX_SCRIPT_BYTES) - wb->coinb3len,
 			&extension_plan.outputs[i]);
