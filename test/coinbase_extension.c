@@ -59,8 +59,9 @@ int main(void)
 
 	doc = parse("{\"5trat\":{\"previous_bonus\":0,\"previous_payout_script\":\"00\"}}");
 	assert(doc);
-	assert(!coinbase_extension_plan("5trat-delayed-jackpot", yyjson_doc_get_root(doc),
-					475000000, &plan));
+	assert(coinbase_extension_plan("5trat-delayed-jackpot", yyjson_doc_get_root(doc),
+				       475000000, &plan));
+	assert(plan.output_count == 0);
 	yyjson_doc_free(doc);
 
 	doc = parse("{\"5trat\":{\"previous_bonus\":700000000,\"previous_payout_script\":\"00\"}}");
