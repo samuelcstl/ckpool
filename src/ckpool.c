@@ -30,6 +30,7 @@
 #include "generator.h"
 #include "stratifier.h"
 #include "connector.h"
+#include "coinbase_extension.h"
 #ifdef HAVE_SV2
 #include "sv2_jdc.h"
 #endif
@@ -1730,6 +1731,16 @@ static void parse_config(void)
 			parse_btcds(arr_val, arr_size);
 	}
 	yyjson_obj_get_string(&ckpool.btcaddress, json_conf, "btcaddress");
+
+	/* Chain-specific consensus coinbase handling is always explicit. */
+	arr_val = yyjson_obj_get(json_conf, "coinbaseextension");
+	if (arr_val) {
+		if (!yyjson_is_obj(arr_val) ||
+		    !yyjson_obj_get_string(&ckpool.coinbaseextension, arr_val, "type") ||
+		    !coinbase_extension_type_valid(ckpool.coinbaseextension))
+			quit(0, "Invalid coinbaseextension configuration");
+	}
+
 	yyjson_obj_get_string(&ckpool.btcsig, json_conf, "btcsig");
 	if (ckpool.btcsig && strlen(ckpool.btcsig) > 38) {
 		LOGWARNING("Signature %s too long, truncating to 38 bytes", ckpool.btcsig);
