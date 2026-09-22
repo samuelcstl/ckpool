@@ -35,6 +35,11 @@ noinst_LIBRARIES = libckpool.a
 libckpool_a_SOURCES = libckpool.c sha2.c sha256_arm_shani.c sha256_code_release
 libckpool_a_LIBADD = $(native_objs)
 
+check_PROGRAMS = test_address_to_txn
+TESTS = test_address_to_txn
+test_address_to_txn_SOURCES = test_address_to_txn.c
+test_address_to_txn_LDADD = libckpool.a @LIBS@
+
 bin_PROGRAMS = ckpool ckpmsg notifier
 ckpool_SOURCES = ckpool.c generator.c bitcoin.c stratifier.c connector.c \
 		 coinbase_extension.c coinbase_extension.h yyjson.c yyjson_util.c
