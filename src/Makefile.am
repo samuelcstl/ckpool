@@ -37,7 +37,7 @@ libckpool_a_LIBADD = $(native_objs)
 
 bin_PROGRAMS = ckpool ckpmsg notifier
 ckpool_SOURCES = ckpool.c generator.c bitcoin.c payout.c multichain.c stratifier.c connector.c \
-		 yyjson.c yyjson_util.c
+		 coinbase_extension.c coinbase_extension.h yyjson.c yyjson_util.c
 ckpool_LDADD = libckpool.a @LIBS@ @CAPNP_LIBS@ @SV2_LIBS@
 
 if HAVE_CAPNP
