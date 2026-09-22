@@ -73,6 +73,31 @@ int main(void)
 	              "5trat",
 	              "76a914a225d3a26b82e097119dd7a8621ba5fa7bfa02b888ac",
 	              false);
+
+	/*
+	 * PR6 deployments did not require cashaddr_prefix. Exercise the actual
+	 * adapter contract used by stratifier with no configured prefix: an
+	 * explicit CashAddr must decode from its checksum-authenticated supplied
+	 * prefix and must never fall through to legacy Base58 serialization.
+	 */
+	{
+		static const char expected_hex[] =
+			"76a914a225d3a26b82e097119dd7a8621ba5fa7bfa02b888ac";
+		uint8_t expected[25], adapted[64];
+
+		assert(hex2bin(expected, expected_hex, sizeof(expected)));
+		memset(adapted, 0, sizeof(adapted));
+		assert(cashaddr_or_standard_to_script(adapted,
+			"5trat:qz3zt5azdwpwp9c3nht6scsm5ha8h7szhqxtdmhlz5",
+			NULL, false, false) == 25);
+		assert(!memcmp(adapted, expected, sizeof(expected)));
+	}
+	assert(!cashaddr_or_standard_to_script(decoded,
+		"5trat:qz3zt5azdwpwp9c3nht6scsm5ha8h7szhqxtdmhlzq",
+		NULL, false, false));
+	assert(!cashaddr_or_standard_to_script(decoded,
+		"5trat:qz3zt5azdwpwp9c3nht6scsm5ha8h7szhqxtdmhlzQ5",
+		NULL, false, false));
 	assert(!cashaddr_or_standard_to_script(decoded,
 		"5trat:qz3zt5azdwpwp9c3nht6scsm5ha8h7szhqxtdmhlzq",
 		"5trat", false, false));
