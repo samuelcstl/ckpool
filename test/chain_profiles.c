@@ -59,6 +59,29 @@ static int profile_default(void)
     return 0;
 }
 
+static int profile_fivetrat_legacy_cashaddr(void)
+{
+    static const char *addr =
+        "5trat:qz3zt5azdwpwp9c3nht6scsm5ha8h7szhqxtdmhlz5";
+    static const char expected_hex[] =
+        "76a914a225d3a26b82e097119dd7a8621ba5fa7bfa02b888ac";
+    unsigned char script[64], expected[25];
+    int len;
+
+    memset(&ckpool, 0, sizeof(ckpool));
+    if (payout_local_codec_enabled())
+        return 1;
+    if (!hex2bin(expected, expected_hex, sizeof(expected)))
+        return 2;
+    memset(script, 0, sizeof(script));
+    len = payout_address_to_txn((char *)script, addr, false, false);
+    if (len != (int)sizeof(expected))
+        return 3;
+    if (memcmp(script, expected, sizeof(expected)))
+        return 4;
+    return 0;
+}
+
 static int profile_ppc(void)
 {
     char *path = write_config("{\"coinbase_txntime\":true,\"block_suffix\":\"00\",\"validate_coinbase\":false}\n");
@@ -284,11 +307,12 @@ int main(void)
     run_child(profile_default, "aur-default-caps");
     run_child(profile_default, "bfx-default-caps");
     run_child(profile_default, "lcc-default-caps");
+    run_child(profile_fivetrat_legacy_cashaddr, "5trat-legacy-cashaddr");
     run_child(profile_bch, "bch-cashaddr");
     run_child(profile_ppc, "ppc-serialization");
     run_child(profile_xec, "xec-gbt-consensus");
     run_child(profile_target_fallback, "target-fallback");
     run_child(profile_max_script, "max-script-boundary");
-    puts("Eight-chain profile regressions passed");
+    puts("Multichain profile regressions passed");
     return 0;
 }
