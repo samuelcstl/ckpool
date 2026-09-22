@@ -158,13 +158,14 @@ bool cashaddr_decode(const char *addr, const char *expected_prefix,
 	if (version & 0x80)
 		return false;
 	type = (version >> 3) & 0x0f;
-	if (type != 0 && type != 1)
+	/* CashTokens address types 2/3 use the same P2PKH/P2SH locking scripts. */
+	if (type != 0 && type != 1 && type != 2 && type != 3)
 		return false;
 	/* Size code 0 is the 160-bit payload supported here. */
 	if ((version & 0x07) != 0)
 		return false;
 
-	*is_p2sh = type == 1;
+	*is_p2sh = type == 1 || type == 3;
 	memcpy(hash160, decoded + 1, 20);
 	return true;
 }
@@ -209,10 +210,15 @@ int cashaddr_or_standard_to_script(uint8_t *script, const char *addr,
 
 	if (!script || !addr)
 		return 0;
-	if (expected_prefix && *expected_prefix)
+	if (expected_prefix && *expected_prefix) {
 		len = cashaddr_to_script(addr, expected_prefix, script, NULL);
-	if (len)
-		return len;
+		if (len)
+			return len;
+		/* An explicit-prefix address is claiming CashAddr semantics. Never feed
+		 * malformed or wrong-prefix colon-form text to the Base58 decoder. */
+		if (strchr(addr, ':'))
+			return 0;
+	}
 	return address_to_txn((char *)script, addr, standard_script, segwit);
 }
 
