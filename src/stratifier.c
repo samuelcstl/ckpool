@@ -39,6 +39,7 @@
 #include "utlist.h"
 #include "connector.h"
 #include "generator.h"
+#include "coinbase_extension.h"
 #ifdef HAVE_SV2
 #include "sv2_strat.h"
 #include "sv2_jd.h"
@@ -597,9 +598,11 @@ static int ser_bip34_height(uint8_t *buf, uint32_t height)
 
 static void generate_coinbase(workbase_t *wb)
 {
+	coinbase_extension_plan_t extension_plan = {};
 	uint64_t u64, g64, d64 = 0, mandatory_total = 0;
 	uint32_t u32;
 	uint8_t txout_count;
+	size_t extension_outputs = 0;
 	int i;
 	sdata_t *sdata = ckpool.sdata;
 	char header[272];
@@ -691,17 +694,31 @@ static void generate_coinbase(workbase_t *wb)
 	memcpy(wb->coinb2bin + wb->coinb2len, "\xff\xff\xff\xfe", 4);
 	wb->coinb2len += 4;
 
-	/* Generation value after any consensus-mandatory GBT outputs. */
+	/* Start with the full template value. An explicitly configured extension
+	 * may reserve part of it for consensus-mandated outputs of its own. */
 	g64 = wb->coinbasevalue;
+	if (ckpool.coinbaseextension) {
+		if (!coinbase_extension_plan(ckpool.coinbaseextension, wb->gbtroot,
+					     wb->coinbasevalue, &extension_plan)) {
+			LOGEMERG("Invalid %s coinbase extension metadata; refusing to build unsafe work",
+				 ckpool.coinbaseextension);
+			exit(1);
+		}
+		g64 = extension_plan.miner_value;
+		extension_outputs = extension_plan.output_count;
+	}
+
+	/* Generic GBT-defined outputs and explicit extension outputs are additive.
+	 * Both are deducted from the miner value, never from each other. */
 	for (i = 0; i < wb->mandatory_outputs; i++) {
 		mandatory_total += wb->mandatory_output[i].amount;
-		if (unlikely(mandatory_total > wb->coinbasevalue)) {
-			LOGEMERG("Mandatory GBT outputs exceed coinbasevalue");
+		if (unlikely(mandatory_total > g64)) {
+			LOGEMERG("Mandatory GBT outputs exceed remaining coinbase value");
 			exit(1);
 		}
 	}
 	g64 -= mandatory_total;
-	txout_count = 1 + wb->mandatory_outputs + wb->insert_witness;
+	txout_count = 1 + wb->mandatory_outputs + extension_outputs + wb->insert_witness;
 	if (ckpool.donvalid && ckpool.donation > 0) {
 		double dbl64 = (double)g64 / 100 * ckpool.donation;
 
@@ -722,6 +739,7 @@ static void generate_coinbase(workbase_t *wb)
 	 * CompactSize form (0xfd + uint16). Reserve for the largest wire form,
 	 * not merely the one-byte prefix used by normal P2PKH/P2SH outputs. */
 	wb->coinb3bin = ckzalloc(512 + wb->mandatory_outputs * (8 + 3 + MAX_GBT_OUTPUT_SCRIPT_LEN) +
+			       COINBASE_EXTENSION_MAX_OUTPUTS * (9 + COINBASE_EXTENSION_MAX_SCRIPT_BYTES) +
 			       wb->insert_witness * (8 + witnessdata_size + 2));
 
 	if (ckpool.donvalid && ckpool.donation > 0) {
@@ -754,6 +772,21 @@ static void generate_coinbase(workbase_t *wb)
 		}
 		memcpy(wb->coinb3bin + wb->coinb3len, output->script, output->script_len);
 		wb->coinb3len += output->script_len;
+	}
+
+	for (size_t ext_i = 0; ext_i < extension_outputs; ext_i++) {
+		size_t output_len = coinbase_extension_serialize_output(
+			(unsigned char *)wb->coinb3bin + wb->coinb3len,
+			512 + wb->mandatory_outputs * (8 + 3 + MAX_GBT_OUTPUT_SCRIPT_LEN) +
+				COINBASE_EXTENSION_MAX_OUTPUTS * (9 + COINBASE_EXTENSION_MAX_SCRIPT_BYTES) -
+				wb->coinb3len,
+			&extension_plan.outputs[ext_i]);
+		if (!output_len) {
+			LOGEMERG("Unable to serialize %s coinbase extension output",
+				 ckpool.coinbaseextension);
+			exit(1);
+		}
+		wb->coinb3len += output_len;
 	}
 
 	if (wb->insert_witness) {
