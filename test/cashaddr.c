@@ -68,6 +68,18 @@ int main(void)
 	expect_script("ecash:ppm2qsznhks23z7629mms6s4cwef74vcwv2zrv3l8h",
 	              "ecash", p2sh_script, true);
 
+	/* Exact payout regression from 5TRAT block 19243. */
+	expect_script("5trat:qz3zt5azdwpwp9c3nht6scsm5ha8h7szhqxtdmhlz5",
+	              "5trat",
+	              "76a914a225d3a26b82e097119dd7a8621ba5fa7bfa02b888ac",
+	              false);
+	assert(!cashaddr_or_standard_to_script(decoded,
+		"5trat:qz3zt5azdwpwp9c3nht6scsm5ha8h7szhqxtdmhlzq",
+		"5trat", false, false));
+	assert(!cashaddr_or_standard_to_script(decoded,
+		"5trat:qz3zt5azdwpwp9c3nht6scsm5ha8h7szhqxtdmhlzQ5",
+		"5trat", false, false));
+
 	/* Prefix and case are consensus-relevant parts of CashAddr decoding. */
 	assert(!cashaddr_decode(
 		"bitcoincash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a",
