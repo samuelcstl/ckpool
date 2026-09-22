@@ -206,19 +206,44 @@ int cashaddr_or_standard_to_script(uint8_t *script, const char *addr,
                                    const char *expected_prefix,
                                    bool standard_script, bool segwit)
 {
+	const char *sep;
+	char supplied_prefix[84];
+	size_t supplied_len;
 	int len = 0;
 
 	if (!script || !addr)
 		return 0;
+
+	sep = strchr(addr, ':');
 	if (expected_prefix && *expected_prefix) {
 		len = cashaddr_to_script(addr, expected_prefix, script, NULL);
 		if (len)
 			return len;
-		/* An explicit-prefix address is claiming CashAddr semantics. Never feed
-		 * malformed or wrong-prefix colon-form text to the Base58 decoder. */
-		if (strchr(addr, ':'))
+		/* A configured prefix is policy as well as a codec hint. Explicit
+		 * CashAddr text that is malformed or names another prefix must fail
+		 * closed and can never reach the legacy Base58 serializer. */
+		if (sep)
 			return 0;
+	} else if (sep) {
+		/*
+		 * Preserve the PR6 safety contract for existing deployments that
+		 * predate cashaddr_prefix. The explicit CashAddr prefix is covered by
+		 * its checksum, so it is sufficient to select the codec here after
+		 * the normal node validation path has admitted the payout address.
+		 *
+		 * Most importantly, no colon-form address may ever fall through to
+		 * address_to_txn(), whose legacy Base58 decoder will otherwise produce
+		 * a valid-looking script for the wrong hash160.
+		 */
+		supplied_len = (size_t)(sep - addr);
+		if (!supplied_len || supplied_len >= sizeof(supplied_prefix))
+			return 0;
+		memcpy(supplied_prefix, addr, supplied_len);
+		supplied_prefix[supplied_len] = '\0';
+		len = cashaddr_to_script(addr, supplied_prefix, script, NULL);
+		return len;
 	}
+
 	return address_to_txn((char *)script, addr, standard_script, segwit);
 }
 
