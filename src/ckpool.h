@@ -281,6 +281,9 @@ struct ckpool_instance {
 	bool donvalid; // Donation address works on this network
 	double donation; // Percentage donation to development
 
+	/* Optional explicit adapter for chain-specific consensus coinbase outputs. */
+	char *coinbaseextension;
+
 	/* Stratum options */
 	server_instance_t **servers;
 	char **serverurl; // Array of URLs to bind our server/proxy to
