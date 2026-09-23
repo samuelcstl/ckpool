@@ -157,7 +157,8 @@ static int profile_xec(void)
         "{\"amount\":\"/coinbasetxn/minerfund/minimumvalue\","
         "\"address\":\"/coinbasetxn/minerfund/addresses/0\"},"
         "{\"amount\":\"/coinbasetxn/stakingrewards/minimumvalue\","
-        "\"script\":\"/coinbasetxn/stakingrewards/payoutscript/hex\"}]}\n");
+        "\"script\":\"/coinbasetxn/stakingrewards/payoutscript/hex\","
+        "\"optional\":true}]}\n");
     path = write_config(config);
     if (!path)
         return 1;
@@ -204,6 +205,38 @@ static int profile_xec(void)
         rc = 6;
     else if (fabs(gbt.effective_diff - 1.0) > 0.000001)
         rc = 7;
+
+    /*
+     * Staking rewards are absent from some valid eCash templates, notably
+     * during RTT/heartbeat operation. Miner fund remains mandatory, while the
+     * staking output must be consumed when present and skipped when absent.
+     */
+    if (!rc) {
+        yyjson_doc_free(doc);
+        doc = yyjson_read(
+            "{\"coinbasetxn\":{\"minerfund\":{\"minimumvalue\":3200,"
+            "\"addresses\":[\"ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2\"]}},"
+            "\"rtt\":{\"nexttarget\":\"1d00ffff\"}}",
+            strlen(
+            "{\"coinbasetxn\":{\"minerfund\":{\"minimumvalue\":3200,"
+            "\"addresses\":[\"ecash:qpm2qsznhks23z7629mms6s4cwef74vcwva87rkuu2\"]}},"
+            "\"rtt\":{\"nexttarget\":\"1d00ffff\"}}"), 0);
+        if (!doc) {
+            rc = 9;
+        } else {
+            memset(&gbt, 0, sizeof(gbt));
+            gbt.coinbasevalue = 10000;
+            gbt.diff = 9.0;
+            if (!multichain_apply_gbt(&gbt, yyjson_doc_get_root(doc)))
+                rc = 10;
+            else if (gbt.mandatory_outputs != 1 ||
+                     gbt.mandatory_output[0].amount != 3200 ||
+                     gbt.mandatory_output[0].script_len != 25)
+                rc = 11;
+            else if (fabs(gbt.effective_diff - 1.0) > 0.000001)
+                rc = 12;
+        }
+    }
 out:
     if (doc)
         yyjson_doc_free(doc);
