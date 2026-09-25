@@ -1,0 +1,170 @@
+# Multichain compatibility
+
+This fork keeps current upstream ckpool behavior as the default and represents Bitcoin-derived chain differences as explicit protocol capabilities and configuration rather than coin-name conditionals wherever practical.
+
+## Deployed provenance baseline
+
+The multichain work is grounded in pool implementations already deployed in the local mining lanes, not in hypothetical chain support.
+
+| Chain | Proven deployed pool lineage | Deployed revision | Local source hacks | What this means for the unified fork |
+| --- | --- | --- | --- | --- |
+| BTC | upstream `ckolivas/ckpool` | `c26eb7ff` | none | upstream behavior is the default contract |
+| DGB | upstream `ckolivas/ckpool` | same binary as BTC | none | no DGB-specific source behavior is required by the deployed lane |
+| AUR | upstream `ckolivas/ckpool` | same binary as BTC | none | no AUR-specific source behavior is required |
+| BFX | upstream `ckolivas/ckpool` | same binary as BTC | none | no BFX-specific source behavior is required |
+| BCH | `skaisser/ckpool` | `0479f860` | no meaningful local edits | port the BCH fork's protocol requirements as generic capabilities where possible |
+| XEC | `Bitcoin-ABC/ecash-ckpool-solo` | `10bcb1ca` | no meaningful local edits | port mandatory eCash coinbase/RTT/address behavior without changing BTC defaults |
+| PPC | qualified keyless PPC ckpool lineage retained in this repository | qualification tip `9bfb38a9` | qualified source delta | port transaction/block serialization differences as explicit capabilities |
+| LCC | unified multichain fork | `6ff395fb` live baseline | none | SHA256d GBT path is live-proven, including main-chain block 4507116 |
+
+The unified branch is based on current upstream source, while the previously qualified PPC lineage remains in Git ancestry and its qualification documents remain in-tree.
+
+## getblocktemplate fixed parameters
+
+Three generic configuration keys cover fixed `getblocktemplate` request variation:
+
+- `gbtparams`: an optional JSON object merged into the standard first BIP22/BIP23 template-request object. Configured keys replace the built-in value with the same key.
+- `gbtdrop`: an optional array of field names removed from that first template-request object after `gbtparams` is applied.
+- `gbtargs`: an optional JSON array whose values are appended as additional JSON-RPC positional parameters after the first template-request object.
+
+The operations are deliberately generic. They correspond to add/replace, remove, and append rather than to named chains. The resolved GBT request is cached once per ckpool process because runtime configuration is startup-static.
+
+### Bitcoin, DigiByte, Auroracoin and Bitfinite deployed lanes
+
+No override is required by the currently deployed ckpool instances:
+
+```json
+{}
+```
+
+DigiByte nodes can expose an algorithm positional argument in their RPC interface. If an installation needs to select it explicitly, the generic representation is available without a DigiByte source branch:
+
+```json
+{
+  "gbtargs": ["sha256d"]
+}
+```
+
+This is an available configuration mechanism, not a claim that the currently deployed DGB lane requires it.
+
+### Litecoin Cash SHA256d
+
+The LCC node requires a fixed `powalgo` field for SHA256d template selection:
+
+```json
+{
+  "gbtparams": {
+    "powalgo": "sha256d"
+  }
+}
+```
+
+### Bitcoin Cash GBT and payout codec
+
+The deployed BCH fork requests a template without the SegWit `rules` member and uses CashAddr payouts. The generic profile is:
+
+```json
+{
+  "gbtdrop": ["rules"],
+  "cashaddr_prefix": "bitcoincash"
+}
+```
+
+CashAddr P2PKH/P2SH admission and script construction are local and prefix-driven, including valid prefixless CashAddr payloads. When an address does not match the configured CashAddr prefix, validation and Base58/SegWit construction fall back to the upstream daemon path. While a local codec is configured, a daemon-accepted fallback address is admitted only if the payout serializer can encode it, preventing newer unsupported address forms from producing an unusable coinbase output. Default Bitcoin behavior remains unchanged when no local codec is configured.
+
+`gbtparams` and `gbtargs` preserve JSON value types, so future chains may provide booleans, numbers, strings, arrays, objects, or null values without adding chain-specific code. `gbtdrop` entries must be strings.
+
+## Capability inventory
+
+All currently known consensus- and payout-relevant deltas from the proven implementations are represented behind generic capabilities. Fleet readiness remains gated on the consolidated ARM64 and live-node acceptance pass.
+
+| Capability | BTC/DGB/AUR/BFX | LCC | PPC | BCH | XEC |
+| --- | --- | --- | --- | --- | --- |
+| standard upstream GBT | default | plus fixed param | default | drop `rules` | default request shape |
+| configurable fixed GBT data | supported | `powalgo=sha256d` | available | remove `rules` | available |
+| standard Bitcoin transaction serialization | yes | yes | no | yes | yes |
+| transaction `nTime` | no | no | required | no | no |
+| trailing block signature vector | no | no | required empty vector | no | no |
+| Base58 payout scripts | yes | yes | required | legacy supported | legacy supported |
+| CashAddr payout scripts | no | no | no | required | required |
+| mandatory GBT-defined coinbase outputs | no | no | no | no | miner fund + staking rewards |
+| alternate next-block target from GBT | no | no | no | no | RTT target |
+| suppress post-submit `preciousblock` | no | no | no | no | required for Avalanche compatibility |
+| strict negotiated SV1 version mask | implemented | implemented; LCC live-proven at `0000e000` | implemented; PPC qualified at `1fffe000` | implemented | implemented |
+
+The implementation is now decomposed into four generic layers:
+
+1. **GBT request shaping** through `gbtparams`, `gbtdrop`, and `gbtargs`.
+2. **Address/script codecs** through configurable CashAddr support shared by BCH and XEC while preserving normal Base58/SegWit behavior by default.
+3. **Coinbase/block capabilities** through optional transaction timestamp, optional block suffix, and configurable mandatory outputs sourced from GBT.
+4. **Mining semantics** through selectable target source, selectable post-submit chain-tip behavior, and strict per-client SV1 version-mask negotiation/reconstruction.
+
+## GBT-defined coinbase outputs and effective target
+
+`gbtoutputs` is an optional array of generic descriptors. Each entry supplies an RFC6901-style JSON pointer in `amount` and exactly one pointer in `address` or `script`. `optional:true` permits a descriptor to disappear from a template; otherwise missing configured data rejects that template. Address outputs use the configured payout codec, including `cashaddr_prefix` when present. Script outputs consume raw scriptPubKey hex from GBT. All configured amounts are subtracted from the miner/pool generation value and emitted as separate transaction outputs before any witness commitment.
+
+`gbttarget` is an optional JSON pointer to a compact 4-byte target string. When present it replaces the effective block-solve/network difficulty used by ckpool while leaving the actual header nBits untouched. If the pointed field is absent on a particular template, normal GBT difficulty is retained.
+
+The current eCash profile is therefore data only:
+
+```json
+{
+  "cashaddr_prefix": "ecash",
+  "gbtoutputs": [
+    {
+      "amount": "/coinbasetxn/minerfund/minimumvalue",
+      "address": "/coinbasetxn/minerfund/addresses/0"
+    },
+    {
+      "amount": "/coinbasetxn/stakingrewards/minimumvalue",
+      "script": "/coinbasetxn/stakingrewards/payoutscript/hex"
+    }
+  ],
+  "gbttarget": "/rtt/nexttarget",
+  "preciousblock": false
+}
+```
+
+This matches the ordinary GBT shape used by the Bitcoin ABC ckpool reference. Installations using another GBT shape, including simple-GBT script fields, can point the same generic descriptors at those fields without adding coin-specific C code.
+
+## Peercoin serialization profile
+
+The previously qualified keyless Peercoin path is represented without a Peercoin code branch:
+
+```json
+{
+  "coinbase_txntime": true,
+  "block_suffix": "00",
+  "validate_coinbase": false
+}
+```
+
+`coinbase_txntime` inserts the template nTime after the transaction version in the coinbase transaction. `block_suffix` appends opaque validated hex after the transaction vector; `00` is the empty trailing block-signature vector required by the qualified PoW CBlock serialization. `validate_coinbase:false` honestly skips the daemon `decoderawtransaction` startup check for transaction formats the daemon RPC does not decode; it does not fabricate a successful RPC response. Block submission and consensus acceptance remain authoritative. The default values preserve Bitcoin behavior.
+
+`preciousblock` is also a generic boolean capability and defaults to `true`. Setting it to `false` suppresses the post-submit chain-tip hint without affecting `submitblock` itself.
+
+## Public repository boundary
+
+These settings contain protocol configuration only. Runtime credentials, payout private keys, private network addresses, node cookies, host-specific paths, live service configuration and recovery material must not be committed to this public repository. This repository must never use self-hosted GitHub Actions runners.
+
+## Design rule
+
+Prefer a generic configurable representation whenever a protocol difference can be described as data or an orthogonal capability. Do not use coin tickers as switches in common code when an explicit capability can express the same requirement. A tightly coupled consensus feature may have its own named capability only when decomposing it would make correctness harder to reason about.
+
+
+## Hosted regression matrix
+
+The source-level qualification matrix intentionally tests protocol profiles rather than branching on coin names. `test/chain_profiles.c` runs each profile in a fresh child process so startup-static configuration cannot bleed between cases.
+
+| Lane | Generic profile exercised in hosted tests | Prior live/provenance evidence |
+| --- | --- | --- |
+| BTC | all optional multichain capabilities unset | upstream default contract |
+| DGB | Bitcoin-default consensus capabilities | deployed with upstream binary |
+| AUR | Bitcoin-default consensus capabilities | deployed with upstream binary |
+| BFX | Bitcoin-default consensus capabilities | deployed with upstream binary |
+| LCC | Bitcoin-default serialization; SHA256d GBT selection remains `gbtparams.powalgo` | unified fork already mined an accepted main-chain block at height 4507116 |
+| BCH | `cashaddr_prefix=bitcoincash`; request profile drops `rules` | deployed `skaisser/ckpool` lineage audited for BCH protocol deltas |
+| PPC | `coinbase_txntime`, `block_suffix=00`, `validate_coinbase=false` | 51 consecutive qualified testnet blocks on the retained keyless lineage |
+| XEC | eCash CashAddr, mandatory GBT outputs, RTT target, `preciousblock=false` | fields and output ordering cross-checked against Bitcoin ABC GBT and reference ckpool |
+
+The hosted matrix additionally checks missing RTT-target fallback and the maximum configured 512-byte script boundary. Hosted success is a source/build regression gate, not a substitute for the final ARM64 and live-node acceptance pass.

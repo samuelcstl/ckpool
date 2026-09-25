@@ -1,0 +1,16 @@
+Peercoin ckpool no-private-key fork
+===================================
+
+base_commit=8c9ce18d91311ff9a515a3125a50bfa04c03250a
+reference_ppc_commit=a3b626416262d5ef5cb30466dcd6cc6a6711bee2
+branch=ppc-no-private-key-v1
+
+Security invariant:
+- no payout private key accepted by configuration
+- no payout private key loaded by ckpool
+- no ECDSA block-signing state
+- payout generated from configured/public address
+- current Peercoin PoW serializes empty vchBlockSig
+
+Qualification target:
+Peercoin testnet real block accepted by peercoind via submitblock.

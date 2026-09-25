@@ -14,6 +14,7 @@
 #include "ckpool.h"
 #include "libckpool.h"
 #include "bitcoin.h"
+#include "multichain.h"
 #include "stratifier.h"
 #include "yyjson.h"
 
@@ -120,7 +121,145 @@ out:
 	return doc;
 }
 
-static const char *gbt_req = "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": [\"coinbasetxn\", \"workid\", \"coinbase/append\"], \"rules\" : [\"segwit\"]}]}\n";
+/*
+ * Build the getblocktemplate request from the normal Bitcoin defaults plus
+ * optional fixed configuration data. gbtparams is merged into the first
+ * BIP22/BIP23 request object with configured values replacing defaults,
+ * gbtdrop removes fields from that object, and gbtargs is appended as
+ * additional JSON-RPC positional parameters.
+ *
+ * Configuration is immutable after startup, so resolve the request once per
+ * process and reuse it for all subsequent GBT calls. This keeps the generic
+ * extension mechanism off the hot path and avoids repeatedly reopening the
+ * configuration file.
+ */
+static const char *build_gbt_req(void)
+{
+	static char *cached_req;
+	yyjson_mut_doc *req_doc;
+	yyjson_mut_val *root, *params, *request, *capabilities, *rules;
+	yyjson_doc *conf_doc = NULL;
+	yyjson_val *conf_root = NULL, *configured, *key, *val;
+	yyjson_read_err err;
+	char *req = NULL;
+
+	if (cached_req)
+		return cached_req;
+
+	req_doc = yyjson_mut_doc_new(&ckyyalc);
+	if (unlikely(!req_doc))
+		return NULL;
+
+	root = yyjson_mut_obj(req_doc);
+	params = yyjson_mut_arr(req_doc);
+	request = yyjson_mut_obj(req_doc);
+	capabilities = yyjson_mut_arr(req_doc);
+	rules = yyjson_mut_arr(req_doc);
+	if (unlikely(!root || !params || !request || !capabilities || !rules))
+		goto out;
+
+	yyjson_mut_doc_set_root(req_doc, root);
+	if (!yyjson_mut_obj_add_str(req_doc, root, "method", "getblocktemplate"))
+		goto out;
+	if (!yyjson_mut_arr_add_str(req_doc, capabilities, "coinbasetxn") ||
+	    !yyjson_mut_arr_add_str(req_doc, capabilities, "workid") ||
+	    !yyjson_mut_arr_add_str(req_doc, capabilities, "coinbase/append") ||
+	    !yyjson_mut_obj_add_val(req_doc, request, "capabilities", capabilities) ||
+	    !yyjson_mut_arr_add_str(req_doc, rules, "segwit") ||
+	    !yyjson_mut_obj_add_val(req_doc, request, "rules", rules) ||
+	    !yyjson_mut_arr_add_val(params, request) ||
+	    !yyjson_mut_obj_add_val(req_doc, root, "params", params))
+		goto out;
+
+	if (ckpool.config)
+		conf_doc = yyjson_read_file(ckpool.config, YYJSON_READ_STOP_WHEN_DONE, NULL, &err);
+	if (!conf_doc)
+		goto write;
+
+	conf_root = yyjson_doc_get_root(conf_doc);
+	if (!yyjson_is_obj(conf_root))
+		goto write;
+
+	configured = yyjson_obj_get(conf_root, "gbtparams");
+	if (configured && !yyjson_is_null(configured)) {
+		yyjson_obj_iter iter;
+
+		if (!yyjson_is_obj(configured)) {
+			LOGERR("gbtparams must be a JSON object");
+			goto out;
+		}
+		iter = yyjson_obj_iter_with(configured);
+		while ((key = yyjson_obj_iter_next(&iter))) {
+			const char *name = yyjson_get_str(key);
+			yyjson_mut_val *mut_key, *mut_val;
+
+			val = yyjson_obj_iter_get_val(key);
+			if (unlikely(!name || !val))
+				goto out;
+			mut_key = yyjson_mut_strcpy(req_doc, name);
+			mut_val = yyjson_val_mut_copy(req_doc, val);
+			if (unlikely(!mut_key || !mut_val ||
+			             !yyjson_mut_obj_put(request, mut_key, mut_val)))
+				goto out;
+		}
+	}
+
+	configured = yyjson_obj_get(conf_root, "gbtdrop");
+	if (configured && !yyjson_is_null(configured)) {
+		size_t i, count;
+
+		if (!yyjson_is_arr(configured)) {
+			LOGERR("gbtdrop must be a JSON array");
+			goto out;
+		}
+		count = yyjson_arr_size(configured);
+		for (i = 0; i < count; i++) {
+			const char *name;
+
+			val = yyjson_arr_get(configured, i);
+			if (unlikely(!yyjson_is_str(val))) {
+				LOGERR("gbtdrop entries must be strings");
+				goto out;
+			}
+			name = yyjson_get_str(val);
+			if (unlikely(!name))
+				goto out;
+			yyjson_mut_obj_remove_key(request, name);
+		}
+	}
+
+	configured = yyjson_obj_get(conf_root, "gbtargs");
+	if (configured && !yyjson_is_null(configured)) {
+		size_t i, count;
+
+		if (!yyjson_is_arr(configured)) {
+			LOGERR("gbtargs must be a JSON array");
+			goto out;
+		}
+		count = yyjson_arr_size(configured);
+		for (i = 0; i < count; i++) {
+			yyjson_mut_val *mut_val;
+
+			val = yyjson_arr_get(configured, i);
+			mut_val = yyjson_val_mut_copy(req_doc, val);
+			if (unlikely(!mut_val || !yyjson_mut_arr_add_val(params, mut_val)))
+				goto out;
+		}
+	}
+
+write:
+	req = yyjson_mut_write(req_doc, YYJSON_WRITE_NEWLINE_AT_END, NULL);
+	if (req) {
+		cached_req = req;
+		req = NULL;
+	}
+out:
+	if (conf_doc)
+		yyjson_doc_free(conf_doc);
+	yyjson_mut_doc_free(req_doc);
+	free(req);
+	return cached_req;
+}
 
 /* Request getblocktemplate from bitcoind already connected with a connsock_t
  * and then summarise the information to the most efficient set of data
@@ -129,7 +268,7 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 {
 	yyjson_doc *doc = NULL;
 	yyjson_mut_doc *mut_doc;
-	yyjson_val *rules_array, *coinbase_aux, *res_val, *root;
+	yyjson_val *rules_array, *coinbase_aux, *res_val, *root, *version_val;
 	yyjson_mut_val *mut_root;
 	const char *previousblockhash;
 	char hash_swap[32], tmp[32];
@@ -138,12 +277,18 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	const char *flags;
 	const char *bits;
 	const char *rule;
+	const char *gbt_req;
 	int version;
 	int curtime;
 	int height;
 	int i;
 	bool ret = false;
 
+	gbt_req = build_gbt_req();
+	if (unlikely(!gbt_req)) {
+		LOGERR("Failed to build getblocktemplate request");
+		return ret;
+	}
 	doc = yyjson_rpc_call(cs, gbt_req);
 	if (!doc) {
 		LOGWARNING("%s:%s Failed to get valid json response to getblocktemplate", cs->url, cs->port);
@@ -157,6 +302,10 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	res_val = yyjson_obj_get(root, "result");
 	if (!res_val) {
 		LOGWARNING("Failed to get result in json response to getblocktemplate");
+		goto out;
+	}
+	if (unlikely(!multichain_config_valid())) {
+		LOGERR("Invalid multichain capability configuration");
 		goto out;
 	}
 
@@ -175,7 +324,8 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 
 	previousblockhash = yyjson_get_str(yyjson_obj_get(res_val, "previousblockhash"));
 	target = yyjson_get_str(yyjson_obj_get(res_val, "target"));
-	version = yyjson_get_num(yyjson_obj_get(res_val, "version"));
+	version_val = yyjson_obj_get(res_val, "version");
+	version = yyjson_get_num(version_val);
 	curtime = yyjson_get_num(yyjson_obj_get(res_val, "curtime"));
 	bits = yyjson_get_str(yyjson_obj_get(res_val, "bits"));
 	height = yyjson_get_num(yyjson_obj_get(res_val, "height"));
@@ -185,7 +335,8 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	if (!flags)
 		flags = "";
 
-	if (unlikely(!previousblockhash || !target || !version || !curtime || !bits || !coinbase_aux)) {
+	if (unlikely(!previousblockhash || !target || !version_val || !yyjson_is_num(version_val) ||
+	             !curtime || !bits || !coinbase_aux)) {
 		LOGERR("JSON failed to decode GBT %s %s %d %d %s %s", previousblockhash, target, version, curtime, bits, flags);
 		goto out;
 	}
@@ -242,6 +393,12 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	gbt->coinbasevalue = coinbasevalue;
 
 	gbt->height = height;
+
+	if (unlikely(!multichain_apply_gbt(gbt, res_val))) {
+		LOGERR("Failed to apply configured GBT consensus capabilities");
+		yyjson_mut_doc_free(mut_doc);
+		goto out;
+	}
 
 	/* The flags are optional non-consensus data appended to the coinbase
 	 * scriptsig and are decoded into fixed size buffers, so discard any
