@@ -105,6 +105,27 @@ int main(void)
 		"5trat:qz3zt5azdwpwp9c3nht6scsm5ha8h7szhqxtdmhlzQ5",
 		"5trat", false, false));
 
+	/*
+	 * FRIO P2QR v2 uses an ordinary Bech32m witness program with a
+	 * chain-specific HRP. Once the node has validated the address and declared
+	 * it witness, the generic witness codec must construct OP_2 <32 bytes>
+	 * without caring about the HRP.
+	 */
+	{
+		static const char expected_hex[] =
+			"522017c1a313979e3636277e95155e80fbf4c5cc7f05f4406b5692fac97d1bc791e4";
+		static const char *addr =
+			"frio1zzlq6xyuhncmrvfm7j524aq8m7nzuclc973qxk45jltyh6x78j8jqg6s5fp";
+		uint8_t expected[34], script[64];
+		int len;
+
+		assert(hex2bin(expected, expected_hex, sizeof(expected)));
+		memset(script, 0, sizeof(script));
+		len = address_to_txn((char *)script, addr, false, true);
+		assert(len == (int)sizeof(expected));
+		assert(!memcmp(script, expected, sizeof(expected)));
+	}
+
 	/* Prefix and case are consensus-relevant parts of CashAddr decoding. */
 	assert(!cashaddr_decode(
 		"bitcoincash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a",

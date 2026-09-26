@@ -36,7 +36,7 @@ static bool check_required_rule(const char* rule)
 bool validate_address(connsock_t *cs, const char *address, bool *script, bool *segwit)
 {
 	yyjson_doc *doc;
-	yyjson_val *root, *res_val, *valid_val, *tmp_val;
+	yyjson_val *root, *res_val;
 	char rpc_req[128];
 	bool ret = false;
 
@@ -63,37 +63,12 @@ bool validate_address(connsock_t *cs, const char *address, bool *script, bool *s
 		LOGERR("Failed to get result json response to validate_address");
 		goto out;
 	}
-	valid_val = yyjson_obj_get(res_val, "isvalid");
-	if (!valid_val) {
-		LOGERR("Failed to get isvalid json response to validate_address");
-		goto out;
-	}
-	if (!yyjson_is_true(valid_val)) {
-		LOGDEBUG("Bitcoin address %s is NOT valid", address);
-		goto out;
-	}
-	ret = true;
-	tmp_val = yyjson_obj_get(res_val, "isscript");
-	if (unlikely(!tmp_val)) {
-		/* All recent bitcoinds with wallet support built in should
-		 * support this, if not, look for addresses the braindead way
-		 * to tell if it's a script address. */
-		LOGDEBUG("No isscript support from bitcoind");
-		if (address[0] == '3' || address[0] == '2')
-			*script = true;
-		/* Now look to see this isn't a bech32: We can't support
-		 * bech32 without knowing if it's a pubkey or a script */
-		else if (address[0] != '1' && address[0] != 'm')
-			ret = false;
-		goto out;
-	}
-	*script = yyjson_is_true(tmp_val);
-	tmp_val = yyjson_obj_get(res_val, "iswitness");
-	if (unlikely(!tmp_val))
-		goto out;
-	*segwit = yyjson_is_true(tmp_val);
-	LOGDEBUG("Bitcoin address %s IS valid%s%s", address, *script ? " script" : "",
-		 *segwit ? " segwit" : "");
+	ret = classify_validate_address(address, res_val, script, segwit);
+	if (!ret)
+		LOGDEBUG("Bitcoin address %s is NOT valid or unsupported", address);
+	else
+		LOGDEBUG("Bitcoin address %s IS valid%s%s", address, *script ? " script" : "",
+			 *segwit ? " segwit" : "");
 out:
 	if (doc)
 		yyjson_doc_free(doc);

@@ -22,6 +22,60 @@
 #include "cashaddr.h"
 #include "yyjson.h"
 
+/*
+ * Classify a node-authoritative validateaddress result for payout construction.
+ *
+ * Some Core-family chains define additional witness destination types whose
+ * validateaddress response has iswitness/witness_version but deliberately no
+ * isscript field. Witness payout construction does not need the P2SH/P2WSH
+ * distinction because address_to_txn() takes the witness path first, so a
+ * missing isscript must not make an otherwise valid witness address fail.
+ *
+ * Keep the legacy prefix fallback only for non-witness responses from old
+ * daemons that omit isscript entirely.
+ */
+bool classify_validate_address(const char *address, yyjson_val *res_val,
+			       bool *script, bool *segwit)
+{
+	yyjson_val *valid_val, *script_val, *witness_val;
+
+	if (unlikely(!address || !res_val || !script || !segwit))
+		return false;
+
+	*script = false;
+	*segwit = false;
+
+	valid_val = yyjson_obj_get(res_val, "isvalid");
+	if (!valid_val || !yyjson_is_true(valid_val))
+		return false;
+
+	witness_val = yyjson_obj_get(res_val, "iswitness");
+	script_val = yyjson_obj_get(res_val, "isscript");
+
+	if (witness_val && yyjson_is_true(witness_val)) {
+		*segwit = true;
+		if (script_val)
+			*script = yyjson_is_true(script_val);
+		return true;
+	}
+
+	if (script_val) {
+		*script = yyjson_is_true(script_val);
+		return true;
+	}
+
+	/*
+	 * Ancient daemons may omit both fields. Preserve the historical Base58
+	 * heuristic here, but do not apply it to a node-declared witness address.
+	 */
+	if (address[0] == '3' || address[0] == '2')
+		*script = true;
+	else if (address[0] != '1' && address[0] != 'm')
+		return false;
+
+	return true;
+}
+
 static pthread_once_t cashaddr_prefix_once = PTHREAD_ONCE_INIT;
 static char cashaddr_prefix[84];
 static bool cashaddr_prefix_configured;
