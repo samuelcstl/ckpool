@@ -14,7 +14,9 @@ chain_profiles_LDADD = $(top_srcdir)/src/libckpool.a
 coinbase_extension_SOURCES = coinbase_extension.c \
 	$(top_srcdir)/src/coinbase_extension.c \
 	$(top_srcdir)/src/yyjson.c
-validate_address_SOURCES = validate_address.c
+validate_address_SOURCES = validate_address.c \
+	$(top_srcdir)/src/payout.c \
+	$(top_srcdir)/src/yyjson.c
 validate_address_LDADD = $(top_srcdir)/src/libckpool.a
 
 if HAVE_SV2
