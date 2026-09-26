@@ -31,12 +31,66 @@ static bool check_required_rule(const char* rule)
 	return false;
 }
 
+/*
+ * Classify a node-authoritative validateaddress result for payout construction.
+ *
+ * Some Core-family chains define additional witness destination types whose
+ * validateaddress response has iswitness/witness_version but deliberately no
+ * isscript field. Witness payout construction does not need the P2SH/P2WSH
+ * distinction because address_to_txn() takes the witness path first, so a
+ * missing isscript must not make an otherwise valid witness address fail.
+ *
+ * Keep the legacy prefix fallback only for non-witness responses from old
+ * daemons that omit isscript entirely.
+ */
+bool classify_validate_address(const char *address, yyjson_val *res_val,
+			       bool *script, bool *segwit)
+{
+	yyjson_val *valid_val, *script_val, *witness_val;
+
+	if (unlikely(!address || !res_val || !script || !segwit))
+		return false;
+
+	*script = false;
+	*segwit = false;
+
+	valid_val = yyjson_obj_get(res_val, "isvalid");
+	if (!valid_val || !yyjson_is_true(valid_val))
+		return false;
+
+	witness_val = yyjson_obj_get(res_val, "iswitness");
+	script_val = yyjson_obj_get(res_val, "isscript");
+
+	if (witness_val && yyjson_is_true(witness_val)) {
+		*segwit = true;
+		if (script_val)
+			*script = yyjson_is_true(script_val);
+		return true;
+	}
+
+	if (script_val) {
+		*script = yyjson_is_true(script_val);
+		return true;
+	}
+
+	/*
+	 * Ancient daemons may omit both fields. Preserve the historical Base58
+	 * heuristic here, but do not apply it to a node-declared witness address.
+	 */
+	if (address[0] == '3' || address[0] == '2')
+		*script = true;
+	else if (address[0] != '1' && address[0] != 'm')
+		return false;
+
+	return true;
+}
+
 /* Take a bitcoin address and do some sanity checks on it, then send it to
  * bitcoind to see if it's a valid address */
 bool validate_address(connsock_t *cs, const char *address, bool *script, bool *segwit)
 {
 	yyjson_doc *doc;
-	yyjson_val *root, *res_val, *valid_val, *tmp_val;
+	yyjson_val *root, *res_val;
 	char rpc_req[128];
 	bool ret = false;
 
@@ -63,37 +117,12 @@ bool validate_address(connsock_t *cs, const char *address, bool *script, bool *s
 		LOGERR("Failed to get result json response to validate_address");
 		goto out;
 	}
-	valid_val = yyjson_obj_get(res_val, "isvalid");
-	if (!valid_val) {
-		LOGERR("Failed to get isvalid json response to validate_address");
-		goto out;
-	}
-	if (!yyjson_is_true(valid_val)) {
-		LOGDEBUG("Bitcoin address %s is NOT valid", address);
-		goto out;
-	}
-	ret = true;
-	tmp_val = yyjson_obj_get(res_val, "isscript");
-	if (unlikely(!tmp_val)) {
-		/* All recent bitcoinds with wallet support built in should
-		 * support this, if not, look for addresses the braindead way
-		 * to tell if it's a script address. */
-		LOGDEBUG("No isscript support from bitcoind");
-		if (address[0] == '3' || address[0] == '2')
-			*script = true;
-		/* Now look to see this isn't a bech32: We can't support
-		 * bech32 without knowing if it's a pubkey or a script */
-		else if (address[0] != '1' && address[0] != 'm')
-			ret = false;
-		goto out;
-	}
-	*script = yyjson_is_true(tmp_val);
-	tmp_val = yyjson_obj_get(res_val, "iswitness");
-	if (unlikely(!tmp_val))
-		goto out;
-	*segwit = yyjson_is_true(tmp_val);
-	LOGDEBUG("Bitcoin address %s IS valid%s%s", address, *script ? " script" : "",
-		 *segwit ? " segwit" : "");
+	ret = classify_validate_address(address, res_val, script, segwit);
+	if (!ret)
+		LOGDEBUG("Bitcoin address %s is NOT valid or unsupported", address);
+	else
+		LOGDEBUG("Bitcoin address %s IS valid%s%s", address, *script ? " script" : "",
+			 *segwit ? " segwit" : "");
 out:
 	if (doc)
 		yyjson_doc_free(doc);
