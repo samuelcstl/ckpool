@@ -18,6 +18,8 @@ typedef struct genwork gbtbase_t;
  * under its 100 byte consensus limit. */
 #define MAX_GBT_FLAGS_LEN 32
 
+bool classify_validate_address(const char *address, yyjson_val *res_val,
+                               bool *script, bool *segwit);
 bool validate_address(connsock_t *cs, const char *address, bool *script, bool *segwit);
 int payout_address_to_txn(char *p2h, const char *addr, const bool script,
                           const bool segwit);
